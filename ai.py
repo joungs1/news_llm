@@ -47,20 +47,18 @@ USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
 # --- Pull size limits ---
 NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
 BARS_LIMIT = int(os.getenv("BARS_LIMIT", "120"))
-BARS_INTERVAL = os.getenv("BARS_INTERVAL", "1d")     # matches Finance.finance_ohlcv_cache.bar_interval
-BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")        # matches Finance.finance_ohlcv_cache.period
+BARS_INTERVAL = os.getenv("BARS_INTERVAL", "1d")   # Finance.finance_ohlcv_cache.bar_interval
+BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")      # Finance.finance_ohlcv_cache.period
 
 # Pacing
 SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
 
-# Retry on bad JSON with fallback
+# Retry on bad JSON/schema with fallback
 RETRY_ON_BAD_JSON = os.getenv("RETRY_ON_BAD_JSON", "1").strip() == "1"
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek-r1:latest")
 
 # If your Ollama OpenAI-compatible server supports response_format JSON mode.
-# If not supported, the code auto-falls back.
 FORCE_JSON_MODE = os.getenv("FORCE_JSON_MODE", "1").strip() == "1"
-
 
 # ============================================================
 # TIME HELPERS
@@ -93,7 +91,6 @@ def day_window_for_date(d: Optional[date_cls] = None) -> Tuple[datetime, datetim
     end_local = start_local + timedelta(days=1)
     return start_local.replace(tzinfo=timezone.utc), end_local.replace(tzinfo=timezone.utc)
 
-
 # ============================================================
 # WATCHLIST JSON
 # ============================================================
@@ -125,13 +122,15 @@ def load_watchlist(path: Path) -> List[Dict[str, str]]:
         t = normalize_ticker(row.get("Ticker"))
         if not t or t in seen:
             continue
+        # Guard: skip CLI flags accidentally ending up as tickers
+        if t.startswith("-"):
+            continue
         seen.add(t)
         out.append({
             "ticker": t,
             "name": str(row.get("Potential") or row.get("display_name") or t).strip()
         })
     return out
-
 
 # ============================================================
 # MYSQL
@@ -240,12 +239,8 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
     cur.close()
     cnx.close()
 
-
 # ============================================================
 # FINANCE BARS (FULL SCHEMA: bar_interval + period)
-#   Your schema:
-#     ticker, bar_interval, period, ts_utc, open, high, low, close, volume,
-#     ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low, ...
 # ============================================================
 
 def fetch_finance_bars(ticker: str) -> List[Dict[str, Any]]:
@@ -273,7 +268,6 @@ def fetch_finance_bars(ticker: str) -> List[Dict[str, Any]]:
             r["ts_utc"] = r["ts_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     return rows
 
-
 # ============================================================
 # NEWS (optional; safe if empty)
 # ============================================================
@@ -300,7 +294,6 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
             r["timestamp_utc"] = r["timestamp_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     return rows
 
-
 # ============================================================
 # JSON EXTRACTION (ROBUST)
 # ============================================================
@@ -311,7 +304,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
     raw = text.strip()
 
-    # If the model returned valid JSON, return immediately
+    # Fast path
     try:
         return json.loads(raw)
     except Exception:
@@ -352,9 +345,9 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
     raise ValueError("Found '{' but could not extract a complete JSON object")
 
-
 # ============================================================
-# LLM (OpenAI-compatible via Ollama)
+# LLM
+#   FIX: validate required keys so we never save None/None/None
 # ============================================================
 
 def build_prompt(packet: Dict[str, Any]) -> str:
@@ -382,8 +375,31 @@ def neutral_fallback(reason: str) -> Dict[str, Any]:
         "recommendation_sentence": f"Neutral due to insufficient/invalid model output: {reason}",
         "key_drivers": ["Insufficient structured signal from inputs"],
         "risks": ["Model output parsing failure or missing data"],
-        "what_to_watch_next": ["Verify bars/news ingestion and enable JSON-mode output if supported"],
+        "what_to_watch_next": ["Verify bars/news ingestion and ensure model returns required JSON keys"],
     }
+
+def validate_llm_output(out: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce required keys so dashboard never gets None fields.
+    """
+    if not isinstance(out, dict):
+        raise ValueError("LLM output is not a JSON object")
+
+    required = ("stance", "confidence_0_to_100", "recommendation_sentence",
+                "key_drivers", "risks", "what_to_watch_next")
+    missing = [k for k in required if k not in out]
+
+    # Also reject null/empty core fields
+    if not out.get("stance") or out.get("recommendation_sentence") in (None, "", "null"):
+        if "stance" not in missing:
+            missing.append("stance")
+        if "recommendation_sentence" not in missing:
+            missing.append("recommendation_sentence")
+
+    if missing:
+        raise ValueError(f"LLM output missing required fields: {missing}")
+
+    return out
 
 def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = dict(
@@ -393,14 +409,13 @@ def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str
         max_tokens=650,
         stream=False,
     )
-
-    # Try JSON mode if supported by your Ollama OpenAI-compatible endpoint
     if FORCE_JSON_MODE:
         kwargs["response_format"] = {"type": "json_object"}
 
     resp = client.chat.completions.create(**kwargs)
     text = (resp.choices[0].message.content or "").strip()
-    return extract_json_object(text)
+    out = extract_json_object(text)
+    return validate_llm_output(out)
 
 def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Optional[str]]:
     """
@@ -411,15 +426,16 @@ def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str,
         return out, model, None
     except Exception as e1:
         if not RETRY_ON_BAD_JSON or not FALLBACK_MODEL:
-            raise
+            # return neutral fallback instead of crashing
+            reason = f"primary_failed_no_fallback: {type(e1).__name__}: {e1}"
+            return neutral_fallback(reason), model, reason
+
         try:
             out = run_llm_once(client, FALLBACK_MODEL, packet)
             return out, FALLBACK_MODEL, f"primary_failed: {type(e1).__name__}: {e1}"
         except Exception as e2:
-            # Both failed: return neutral fallback so dashboard still has a rec_sentence
             reason = f"primary={type(e1).__name__}: {e1}; fallback={type(e2).__name__}: {e2}"
             return neutral_fallback(reason), model, reason
-
 
 # ============================================================
 # ORCHESTRATION API (what main.py expects)
@@ -448,8 +464,6 @@ def run_once(
       - fetch finance bars + same-day news (optional)
       - run LLM
       - upsert result to AI.ai_recommendations
-
-    Returns a summary dict for logging.
     """
     global _STATE
     if _STATE is None:
@@ -468,7 +482,7 @@ def run_once(
 
     # optional filter
     if tickers is not None:
-        wanted = {normalize_ticker(t) for t in tickers}
+        wanted = {normalize_ticker(t) for t in tickers if str(t).strip() and not str(t).strip().startswith("-")}
         watch = [w for w in watch if w["ticker"] in wanted]
 
     if max_tickers is not None:
@@ -481,6 +495,12 @@ def run_once(
     for item in watch:
         ticker = item["ticker"]
         name = item["name"]
+
+        # Guard against accidental flags
+        if ticker.startswith("-"):
+            errors.append(f"{ticker}: skipped (looks like CLI flag)")
+            saved_err += 1
+            continue
 
         try:
             bars = fetch_finance_bars(ticker)
@@ -539,16 +559,18 @@ def run_once(
             err = f"{type(e).__name__}: {str(e)}"
             errors.append(f"{ticker}: {err}")
 
+            # Always save a neutral row so dashboard never shows None fields
+            out = neutral_fallback(err)
             row = {
                 "run_date": run_date_val,
                 "as_of_utc": as_of,
                 "ticker": ticker,
                 "company_name": name,
                 "model": DEFAULT_MODEL,
-                "stance": "neutral",
-                "confidence_0_to_100": 10,
-                "recommendation_sentence": f"Neutral due to pipeline error: {err}",
-                "simplified": neutral_fallback(err),
+                "stance": out["stance"],
+                "confidence_0_to_100": out["confidence_0_to_100"],
+                "recommendation_sentence": out["recommendation_sentence"],
+                "simplified": out,
                 "input_digest": {"bar_interval": BARS_INTERVAL, "period": BARS_PERIOD},
                 "error": err,
             }
@@ -574,9 +596,8 @@ def run_once(
         "ts_utc": utc_now().isoformat(),
     }
 
-
 # ============================================================
-# Standalone entrypoint (optional)
+# Standalone entrypoint
 # ============================================================
 
 def main():
