@@ -5,6 +5,7 @@ import os
 import re
 import json
 import time
+import hashlib
 import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,11 @@ import mysql.connector
 # CONFIG
 # ============================================================
 
-THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
+THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "")
+if not THENEWSAPI_TOKEN:
+    # You hardcoded a token in your original snippet; keeping env-first is safer.
+    # If you still want fallback, set it here.
+    THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "")
 
 # MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
@@ -26,7 +31,6 @@ MYSQL_USER = os.getenv("MYSQL_USER", "admin")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
 MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
-
 
 # repo root heuristic
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +54,13 @@ def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def thenewsapi_dt(dt: datetime) -> str:
-    return iso_z(dt)
+    """
+    FIX #1 (400 Bad Request):
+    TheNewsAPI commonly expects UTC timestamps WITHOUT trailing 'Z' in query params.
+    Example: 2026-01-26T19:00:37  (UTC assumed)
+    """
+    dtu = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dtu.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ============================================================
 # UTIL
@@ -73,7 +83,15 @@ def normalize_ticker(raw: Any) -> str:
         s = s[:-3] + ".TO"
     return s
 
+def sha1_hex(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
 def build_ticker_search(ticker: str, name: Optional[str]) -> str:
+    """
+    Note: TheNewsAPI supports boolean-ish search, but syntax can be finicky.
+    Keep your original intent: include name + ticker + base ticker.
+    Use OR terms; avoid insane length.
+    """
     t = normalize_ticker(ticker)
     if not t:
         return ""
@@ -89,15 +107,35 @@ def build_ticker_search(ticker: str, name: Optional[str]) -> str:
     if base != t:
         terms.append(f"\"{base}\"")
 
+    # Use OR (your original)
     return " OR ".join(terms)
 
 def build_company_search(company_obj: dict) -> str:
-    kws = [k.strip() for k in (company_obj.get("keywords") or []) if k and k.strip()]
+    kws = [k.strip() for k in (company_obj.get("keywords") or []) if k and str(k).strip()]
     if not kws:
         name = (company_obj.get("display_name") or company_obj.get("id") or "").strip()
         kws = [name] if name else []
     parts = [f"\"{k}\"" if " " in k else k for k in kws]
+    # Use | (your original)
     return " | ".join(parts)
+
+def safe_parse_published_at(published_at_val: Any) -> Optional[datetime]:
+    """
+    TheNewsAPI often returns published_at like: 2026-01-26T18:37:13Z or with microseconds.
+    We store DATETIME in MySQL (naive UTC).
+    """
+    if not published_at_val:
+        return None
+    s = str(published_at_val).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+    except Exception:
+        return None
 
 # ============================================================
 # CONFIG LOAD
@@ -134,7 +172,21 @@ def mysql_connect(db: Optional[str] = None):
         cfg["database"] = db
     return mysql.connector.connect(**cfg)
 
+def _index_exists(cur, table: str, index_name: str) -> bool:
+    cur.execute(f"SHOW INDEX FROM `{table}` WHERE Key_name=%s", (index_name,))
+    return cur.fetchone() is not None
+
+def _column_exists(cur, table: str, col: str) -> bool:
+    cur.execute(f"SHOW COLUMNS FROM `{table}` LIKE %s", (col,))
+    return cur.fetchone() is not None
+
 def ensure_table():
+    """
+    Keeps your original schema, but applies FIX #2:
+      - allow same URL to be stored for multiple companies/tickers
+      - do this by adding url_hash and unique(company, url_hash)
+      - drop uniq_url if it exists (otherwise you can never store per-ticker rows)
+    """
     cnx = mysql_connect()
     cur = cnx.cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
@@ -143,6 +195,8 @@ def ensure_table():
 
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
+
+    # Create table if missing (original schema + url_hash)
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -155,6 +209,7 @@ def ensure_table():
       published_at DATETIME NULL,
       title TEXT NULL,
       url TEXT NULL,
+      url_hash VARCHAR(40) NULL,
       description TEXT NULL,
       snippet TEXT NULL,
       image_url TEXT NULL,
@@ -182,11 +237,30 @@ def ensure_table():
 
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
-      UNIQUE KEY uniq_url (url(255)),
       KEY idx_company_time (company, timestamp_utc),
       KEY idx_time (timestamp_utc)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+
+    # If table existed before, ensure url_hash exists
+    if not _column_exists(cur, MYSQL_TABLE, "url_hash"):
+        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN url_hash VARCHAR(40) NULL AFTER url")
+
+    # Drop old uniq_url if present (this is what prevents per-ticker storage)
+    if _index_exists(cur, MYSQL_TABLE, "uniq_url"):
+        try:
+            cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` DROP INDEX uniq_url")
+        except Exception:
+            # If it fails, we continue; but you will not get per-ticker rows until removed.
+            pass
+
+    # Add new unique index on (company, url_hash)
+    if not _index_exists(cur, MYSQL_TABLE, "uniq_company_urlhash"):
+        try:
+            cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_company_urlhash (company(191), url_hash)")
+        except Exception:
+            pass
+
     cur.close()
     cnx.close()
 
@@ -199,7 +273,7 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
     sql = f"""
     INSERT INTO `{MYSQL_TABLE}` (
       cycle, timestamp_utc, company,
-      uuid, source, published_at, title, url, description, snippet, image_url,
+      uuid, source, published_at, title, url, url_hash, description, snippet, image_url,
       language, categories, locale, relevance_score,
       sentiment, confidence_0_to_100, one_sentence_summary,
       market_direction, market_time_horizon, market_rationale,
@@ -207,7 +281,7 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
       analysis_json, error
     ) VALUES (
       %s,%s,%s,
-      %s,%s,%s,%s,%s,%s,%s,%s,
+      %s,%s,%s,%s,%s,%s,%s,%s,%s,
       %s,%s,%s,%s,
       %s,%s,%s,
       %s,%s,%s,
@@ -254,6 +328,7 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
             r.get("published_at"),
             r.get("title"),
             r.get("url"),
+            r.get("url_hash"),
             r.get("description"),
             r.get("snippet"),
             r.get("image_url"),
@@ -283,17 +358,43 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
 # TheNewsAPI
 # ============================================================
 
-def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) -> List[Dict[str, Any]]:
+def _resolve_thenewsapi_endpoint(cfg: dict) -> str:
+    # Backward compat: cfg.thenewsapi.endpoint
     api_cfg = (cfg.get("thenewsapi") or {})
-    endpoint = (api_cfg.get("endpoint") or "top").strip().lower()
-    if endpoint not in ("top", "all"):
-        endpoint = "top"
+    endpoint = (api_cfg.get("endpoint") or "").strip().lower()
+    if endpoint in ("top", "all"):
+        return endpoint
 
+    # New config: cfg.query.mode
+    qmode = ((cfg.get("query") or {}).get("mode") or "").strip().lower()
+    if qmode in ("everything", "all"):
+        return "all"
+    return "top"
+
+def _resolve_domains(cfg: dict) -> Tuple[List[str], List[str]]:
+    # Backward compat: cfg.thenewsapi.domains.include/exclude
+    api_cfg = (cfg.get("thenewsapi") or {})
+    dom = api_cfg.get("domains") or {}
+    inc = dom.get("include") or []
+    exc = dom.get("exclude") or []
+
+    # New config: cfg.sources.include/exclude
+    src = cfg.get("sources") or {}
+    if (src.get("mode") or "").strip().lower() == "domains":
+        inc = src.get("include") or inc
+        exc = src.get("exclude") or exc
+
+    return list(inc), list(exc)
+
+def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) -> List[Dict[str, Any]]:
+    endpoint = _resolve_thenewsapi_endpoint(cfg)
     base = f"https://api.thenewsapi.com/v1/news/{endpoint}"
 
     polling = (cfg.get("polling") or {})
     language = polling.get("language", "en")
-    limit = int(polling.get("limit", 50))
+
+    # Your new JSON uses page_size; old code used limit
+    limit = int(polling.get("page_size", polling.get("limit", 50)))
 
     params: Dict[str, Any] = {
         "api_token": THENEWSAPI_TOKEN,
@@ -305,18 +406,22 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
         "page": 1,
     }
 
+    # Optional: search_fields from old cfg.thenewsapi.search_fields
+    api_cfg = (cfg.get("thenewsapi") or {})
     if api_cfg.get("search_fields"):
         params["search_fields"] = api_cfg["search_fields"]
 
+    # Optional: locale from old config
     if api_cfg.get("locale"):
         params["locale"] = ",".join(api_cfg["locale"])
 
-    dom = api_cfg.get("domains") or {}
-    if dom.get("include"):
-        params["domains"] = ",".join(dom["include"])
-    if dom.get("exclude"):
-        params["exclude_domains"] = ",".join(dom["exclude"])
+    include_domains, exclude_domains = _resolve_domains(cfg)
+    if include_domains:
+        params["domains"] = ",".join(include_domains)
+    if exclude_domains:
+        params["exclude_domains"] = ",".join(exclude_domains)
 
+    # Optional categories from old config
     cats = api_cfg.get("categories") or {}
     if cats.get("include"):
         params["categories"] = ",".join(cats["include"])
@@ -326,7 +431,9 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     out: List[Dict[str, Any]] = []
     while True:
         r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # print server message; this helps with 400 debugging
+            raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:800]}", response=r)
         data = r.json() or {}
         items = data.get("data") or []
         out.extend(items if isinstance(items, list) else [])
@@ -462,7 +569,7 @@ def build_runtime(cfg: dict) -> dict:
     # macro companies
     companies = (cfg.get("query") or {}).get("companies") or []
 
-    # tickers
+    # tickers (new config)
     tickers_cfg = cfg.get("tickers") or {}
     tickers_mode = (tickers_cfg.get("mode") or "").strip().lower()
     tickers_track = tickers_cfg.get("track") or []
@@ -492,6 +599,8 @@ def build_runtime(cfg: dict) -> dict:
         "model": chosen_model,
         "companies": companies,
         "tickers": tickers,
+        # dedupe ONLY for avoiding repeated LLM calls in same run:
+        # key is (company, url_hash)
         "seen": set(),
         "last_poll": utc_now() - timedelta(minutes=lookback_minutes),
         "cycle": 0,
@@ -531,59 +640,74 @@ def run_once() -> Tuple[int, datetime]:
     for c in companies:
         company_name = (c.get("display_name") or c.get("id") or "UNKNOWN").strip()
         search = build_company_search(c)
+        if not search:
+            continue
 
         articles = fetch_thenewsapi(cfg, search, last_poll, poll_end)
         for a in articles:
             url = (a.get("url") or "").strip()
-            if not url or url in seen:
+            if not url:
                 continue
-            seen.add(url)
+
+            url_hash = sha1_hex(url)
+            seen_key = (company_name, url_hash)
+            if seen_key in seen:
+                continue
+            seen.add(seen_key)
 
             try:
                 analysis, perf = analyze_article(client, model, a)
                 batch.append({
                     "cycle": _STATE["cycle"],
-                    "timestamp_utc": iso_z(utc_now()),
+                    "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
                     "company": company_name,
+
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
-                    "published_at": a.get("published_at"),
+                    "published_at": safe_parse_published_at(a.get("published_at")),
                     "title": a.get("title"),
                     "url": url,
+                    "url_hash": url_hash,
                     "description": a.get("description"),
                     "snippet": a.get("snippet"),
                     "image_url": a.get("image_url"),
+
                     "language": a.get("language"),
                     "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
+
                     "sentiment": analysis.get("sentiment"),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
+
                     "market_direction": (analysis.get("market_impact") or {}).get("direction"),
                     "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
                     "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
                     "completion_tokens": perf.get("completion_tokens"),
                     "total_tokens": perf.get("total_tokens"),
+
                     "analysis_json": json.dumps(analysis, ensure_ascii=False),
                     "error": None,
                 })
             except Exception as e:
                 batch.append({
                     "cycle": _STATE["cycle"],
-                    "timestamp_utc": iso_z(utc_now()),
+                    "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
                     "company": company_name,
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
-                    "published_at": a.get("published_at"),
+                    "published_at": safe_parse_published_at(a.get("published_at")),
                     "title": a.get("title"),
-                    "url": url or "about:blank",
+                    "url": url,
+                    "url_hash": url_hash,
                     "error": f"analysis_error: {type(e).__name__}: {e}",
                 })
 
-    # B) Ticker queries (key change: company=ticker)
+    # B) Ticker queries (company=ticker)
     for t in tickers:
         ticker = normalize_ticker(t.get("ticker"))
         name = strip_or_none(t.get("name")) or ticker
@@ -597,52 +721,64 @@ def run_once() -> Tuple[int, datetime]:
         articles = fetch_thenewsapi(cfg, search, last_poll, poll_end)
         for a in articles:
             url = (a.get("url") or "").strip()
-            if not url or url in seen:
+            if not url:
                 continue
-            seen.add(url)
+
+            url_hash = sha1_hex(url)
+            seen_key = (ticker, url_hash)
+            if seen_key in seen:
+                continue
+            seen.add(seen_key)
 
             try:
                 analysis, perf = analyze_article(client, model, a)
                 batch.append({
                     "cycle": _STATE["cycle"],
-                    "timestamp_utc": iso_z(utc_now()),
-                    "company": ticker,  # IMPORTANT for ai.py
+                    "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
+                    "company": ticker,  # IMPORTANT for ai.py joins
 
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
-                    "published_at": a.get("published_at"),
+                    "published_at": safe_parse_published_at(a.get("published_at")),
                     "title": a.get("title"),
                     "url": url,
+                    "url_hash": url_hash,
                     "description": a.get("description"),
                     "snippet": a.get("snippet"),
                     "image_url": a.get("image_url"),
+
                     "language": a.get("language"),
                     "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
+
                     "sentiment": analysis.get("sentiment"),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
+
                     "market_direction": (analysis.get("market_impact") or {}).get("direction"),
                     "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
                     "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
                     "completion_tokens": perf.get("completion_tokens"),
                     "total_tokens": perf.get("total_tokens"),
+
                     "analysis_json": json.dumps(analysis, ensure_ascii=False),
                     "error": None,
                 })
             except Exception as e:
                 batch.append({
                     "cycle": _STATE["cycle"],
-                    "timestamp_utc": iso_z(utc_now()),
+                    "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
                     "company": ticker,
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
-                    "published_at": a.get("published_at"),
+                    "published_at": safe_parse_published_at(a.get("published_at")),
                     "title": a.get("title"),
-                    "url": url or "about:blank",
+                    "url": url,
+                    "url_hash": url_hash,
                     "error": f"analysis_error(ticker): {type(e).__name__}: {e}",
                 })
 
