@@ -13,10 +13,14 @@ from typing import Optional, Tuple, List, Dict, Any
 from openai import OpenAI
 import mysql.connector
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 
 # Repo root (adjust if your layout differs; parents[0] = folder containing this file)
-ROOT = Path(__file__).resolve().parents[1]          # repo root
+ROOT = Path(__file__).resolve().parents[1]  # repo root
 CONFIG_PATH = ROOT / "news_llm" / "json" / "news.json"
 
 # MySQL "app login"
@@ -37,47 +41,66 @@ def utc_now() -> datetime:
 def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-def iso_to_mysql_datetime(iso_str: str | None):
-    """
-    Convert ISO8601 string (possibly ending with Z) to MySQL naive UTC DATETIME.
-    """
-    if not iso_str:
-        return None
-    s = iso_str.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-# Backward-compatible alias (your insert_rows_mysql used this name, but it was missing)
-def iso_to_mysql_dt(iso_str: str | None):
-    return iso_to_mysql_datetime(iso_str)
-
 def thenewsapi_dt(dt: datetime) -> str:
-    dt2 = dt.astimezone(timezone.utc).replace(microsecond=0)
-    return dt2.strftime("%Y-%m-%dT%H:%M:%S")
+    # TheNewsAPI accepts ISO-like UTC timestamps; keep Z suffix.
+    return iso_z(dt)
+
+def strip_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
 
 
 # ----------------------------
-# Ollama helpers
+# Watchlist/ticker helpers (NEW)
 # ----------------------------
-def list_ollama_models(ollama_host: str) -> list[str]:
-    r = requests.get(f"{ollama_host}/api/tags", timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return [m.get("name") for m in data.get("models", []) if m.get("name")]
+def normalize_ticker(raw: Any) -> str:
+    """
+    Normalizes a ticker coming from news.json tickers.track:
+      - trim, remove spaces
+      - convert "-TO" to ".TO"
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().replace(" ", "")
+    if not s or s.lower() in {"none", "nan"}:
+        return ""
+    s = s.replace("/", "-")
+    if s.upper().endswith("-TO"):
+        s = s[:-3] + ".TO"
+    return s
 
-def pick_model(models: list[str], preferred: str, fallback_index: int) -> str:
-    if not models:
-        raise RuntimeError("No models found on the Ollama host.")
-    if preferred and preferred in models:
-        return preferred
-    idx = fallback_index - 1
-    if 0 <= idx < len(models):
-        return models[idx]
-    return models[0]
+def build_ticker_search(ticker: str, name: Optional[str]) -> str:
+    """
+    Builds a TheNewsAPI 'search' expression for a single name/ticker.
+    We include both plain and TSX-style tickers because publishers vary.
+    """
+    t = normalize_ticker(ticker)
+    if not t:
+        return ""
+
+    # Also include the base symbol without suffix (RY.TO -> RY)
+    base = t.split(".")[0] if "." in t else t
+
+    terms: List[str] = []
+    if name:
+        nm = str(name).strip()
+        if nm:
+            # Phrase-match for company name, plus a non-phrase token as fallback
+            terms.append(f"\"{nm}\"")
+
+    # Include both ticker variants
+    terms.append(f"\"{t}\"")
+    if base != t:
+        terms.append(f"\"{base}\"")
+
+    # A simple OR query is generally more reliable than clever boolean syntax
+    return " OR ".join(terms)
 
 
 # ----------------------------
-# Query builder
+# Company search builder (existing)
 # ----------------------------
 def build_company_search(company_obj: dict) -> str:
     kws = [k.strip() for k in (company_obj.get("keywords") or []) if k and k.strip()]
@@ -127,118 +150,62 @@ def fetch_thenewsapi(cfg: dict, search: str, published_after: datetime, publishe
     if dom.get("exclude"):
         params["exclude_domains"] = ",".join(dom["exclude"])
 
-    sid = api_cfg.get("source_ids", {}) or {}
-    if sid.get("include"):
-        params["source_ids"] = ",".join(sid["include"])
-    if sid.get("exclude"):
-        params["exclude_source_ids"] = ",".join(sid["exclude"])
+    # categories support
+    cats = api_cfg.get("categories", {}) or {}
+    if cats.get("include"):
+        params["categories"] = ",".join(cats["include"])
+    if cats.get("exclude"):
+        params["exclude_categories"] = ",".join(cats["exclude"])
 
-    cat = api_cfg.get("categories", {}) or {}
-    if cat.get("include"):
-        params["categories"] = ",".join(cat["include"])
-    if cat.get("exclude"):
-        params["exclude_categories"] = ",".join(cat["exclude"])
+    out: List[dict] = []
+    while True:
+        r = requests.get(base, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json() or {}
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            break
 
-    r = requests.get(base, params=params, timeout=30)
-    if r.status_code == 429:
-        hdrs = {k: v for k, v in r.headers.items() if "rate" in k.lower() or "usage" in k.lower()}
-        raise RuntimeError(f"rate_limit_reached (429). headers={hdrs} body={r.text[:500]}")
-    r.raise_for_status()
+        out.extend(items)
 
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(f"TheNewsAPI error: {data.get('error')}")
+        # pagination
+        meta = data.get("meta") or {}
+        next_page = meta.get("next_page")
+        if not next_page:
+            break
+        params["page"] = int(next_page)
 
-    out = []
-    for a in (data.get("data") or []):
-        out.append({
-            "uuid": a.get("uuid"),
-            "source": a.get("source"),
-            "title": a.get("title"),
-            "description": a.get("description"),
-            "keywords": a.get("keywords"),
-            "snippet": a.get("snippet"),
-            "url": a.get("url"),
-            "image_url": a.get("image_url"),
-            "language": a.get("language"),
-            "published_at": a.get("published_at"),
-            "categories": a.get("categories"),
-            "locale": a.get("locale"),
-            "relevance_score": a.get("relevance_score"),
-        })
+        # safety: stop if too many
+        if len(out) >= 5000:
+            break
+
     return out
 
 
 # ----------------------------
-# LLM helpers
+# Ollama helpers
 # ----------------------------
-def extract_json_object(text: str) -> dict:
-    if not text:
-        raise ValueError("Empty model response")
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not m:
-            raise ValueError("Could not locate JSON in model output")
-        return json.loads(m.group(0))
+def list_ollama_models(ollama_host: str) -> list[str]:
+    r = requests.get(f"{ollama_host}/api/tags", timeout=20)
+    r.raise_for_status()
+    j = r.json() or {}
+    models = j.get("models") or []
+    return [m.get("name") for m in models if m.get("name")]
 
-def build_analysis_prompt(article: dict) -> str:
-    def trunc(s: str, n: int) -> str:
-        s = s or ""
-        return s if len(s) <= n else s[:n] + " ...[TRUNCATED]"
-    return f"""
-Return ONLY valid JSON. No markdown.
-
-Article:
-- Source: {trunc(article.get("source") or "", 200)}
-- Title: {trunc(article.get("title") or "", 400)}
-- Description: {trunc(article.get("description") or "", 1400)}
-- Snippet: {trunc(article.get("snippet") or "", 2000)}
-- URL: {article.get("url") or ""}
-
-Schema:
-{{
-  "one_sentence_summary": "string",
-  "sentiment": "positive|neutral|negative",
-  "confidence_0_to_100": 0,
-  "key_points": ["string","string","string"],
-  "market_impact": {{
-    "direction": "bullish|neutral|bearish|unclear",
-    "time_horizon": "short|medium|long",
-    "rationale": "string"
-  }}
-}}
-""".strip()
-
-def analyze_article(client: OpenAI, model: str, article: dict) -> tuple[dict, dict]:
-    prompt = build_analysis_prompt(article)
-    start = time.time()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=2000,
-        stream=False,
-    )
-    elapsed = time.time() - start
-    text = resp.choices[0].message.content or ""
-    parsed = extract_json_object(text)
-
-    usage = getattr(resp, "usage", None)
-    perf = {
-        "elapsed_s": round(elapsed, 3),
-        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
-        "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
-        "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
-    }
-    return parsed, perf
+def pick_model(models: list[str], preferred: str, fallback_index: int) -> str:
+    if preferred and preferred in models:
+        return preferred
+    if not models:
+        raise RuntimeError("No models found on the Ollama host.")
+    if 0 <= fallback_index < len(models):
+        return models[fallback_index]
+    return models[0]
 
 
 # ----------------------------
-# MySQL helpers (auto-migrate)
+# MySQL helpers (table + insert)
 # ----------------------------
-def mysql_connect(db: str | None = None):
+def mysql_connect(db: Optional[str] = None):
     cfg = dict(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
@@ -250,134 +217,67 @@ def mysql_connect(db: str | None = None):
         cfg["database"] = db
     return mysql.connector.connect(**cfg)
 
-def ensure_db():
+def ensure_table_and_migrate():
+    # Create DB if missing
     cnx = mysql_connect()
     cur = cnx.cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
     cur.close()
     cnx.close()
 
-def table_exists(cur) -> bool:
-    cur.execute(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=%s AND table_name=%s",
-        (MYSQL_DB, MYSQL_TABLE),
-    )
-    return cur.fetchone()[0] > 0
-
-def get_existing_columns(cur) -> set[str]:
-    cur.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
-        (MYSQL_DB, MYSQL_TABLE),
-    )
-    return {r[0] for r in cur.fetchall()}
-
-def index_exists(cur, index_name: str) -> bool:
-    cur.execute(
-        "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=%s AND table_name=%s AND index_name=%s",
-        (MYSQL_DB, MYSQL_TABLE, index_name),
-    )
-    return cur.fetchone()[0] > 0
-
-def ensure_table_and_migrate():
-    ensure_db()
+    # Create table if missing (same schema you already used)
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
+    cur.execute(f"""
+    CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE}` (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      cycle INT NULL,
+      timestamp_utc DATETIME NULL,
+      company VARCHAR(255) NULL,
 
-    if not table_exists(cur):
-        create_sql = f"""
-        CREATE TABLE `{MYSQL_TABLE}` (
-          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-          cycle INT NULL,
-          timestamp_utc DATETIME NULL,
-          company VARCHAR(255) NULL,
+      uuid VARCHAR(255) NULL,
+      source VARCHAR(255) NULL,
+      published_at DATETIME NULL,
+      title TEXT NULL,
+      url TEXT NULL,
+      description TEXT NULL,
+      snippet TEXT NULL,
+      image_url TEXT NULL,
 
-          uuid CHAR(36) NULL,
-          source VARCHAR(255) NULL,
-          published_at VARCHAR(64) NULL,
-          title TEXT NULL,
-          url TEXT NOT NULL,
-          description TEXT NULL,
-          snippet TEXT NULL,
-          image_url TEXT NULL,
-          language VARCHAR(16) NULL,
-          categories JSON NULL,
-          locale VARCHAR(16) NULL,
-          relevance_score DOUBLE NULL,
+      language VARCHAR(16) NULL,
+      categories JSON NULL,
+      locale VARCHAR(64) NULL,
+      relevance_score DOUBLE NULL,
 
-          sentiment VARCHAR(16) NULL,
-          confidence_0_to_100 INT NULL,
-          one_sentence_summary TEXT NULL,
-          market_direction VARCHAR(16) NULL,
-          market_time_horizon VARCHAR(16) NULL,
-          market_rationale TEXT NULL,
-          elapsed_s DOUBLE NULL,
-          prompt_tokens INT NULL,
-          completion_tokens INT NULL,
-          total_tokens INT NULL,
-          analysis_json JSON NULL,
+      sentiment VARCHAR(16) NULL,
+      confidence_0_to_100 INT NULL,
+      one_sentence_summary TEXT NULL,
 
-          error TEXT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      market_direction VARCHAR(16) NULL,
+      market_time_horizon VARCHAR(32) NULL,
+      market_rationale TEXT NULL,
 
-          PRIMARY KEY (id),
-          UNIQUE KEY uniq_url (url(255))
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-        cur.execute(create_sql)
-        cur.close()
-        cnx.close()
-        return
+      elapsed_s DOUBLE NULL,
+      prompt_tokens INT NULL,
+      completion_tokens INT NULL,
+      total_tokens INT NULL,
 
-    existing = get_existing_columns(cur)
+      analysis_json JSON NULL,
+      error TEXT NULL,
 
-    desired = {
-        "cycle": "INT NULL",
-        "timestamp_utc": "DATETIME NULL",
-        "company": "VARCHAR(255) NULL",
-
-        "uuid": "CHAR(36) NULL",
-        "source": "VARCHAR(255) NULL",
-        "published_at": "VARCHAR(64) NULL",
-        "title": "TEXT NULL",
-        "url": "TEXT NOT NULL",
-        "description": "TEXT NULL",
-        "snippet": "TEXT NULL",
-        "image_url": "TEXT NULL",
-        "language": "VARCHAR(16) NULL",
-        "categories": "JSON NULL",
-        "locale": "VARCHAR(16) NULL",
-        "relevance_score": "DOUBLE NULL",
-
-        "sentiment": "VARCHAR(16) NULL",
-        "confidence_0_to_100": "INT NULL",
-        "one_sentence_summary": "TEXT NULL",
-        "market_direction": "VARCHAR(16) NULL",
-        "market_time_horizon": "VARCHAR(16) NULL",
-        "market_rationale": "TEXT NULL",
-        "elapsed_s": "DOUBLE NULL",
-        "prompt_tokens": "INT NULL",
-        "completion_tokens": "INT NULL",
-        "total_tokens": "INT NULL",
-        "analysis_json": "JSON NULL",
-
-        "error": "TEXT NULL",
-        "created_at": "TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP",
-    }
-
-    missing = [col for col in desired.keys() if col not in existing]
-    for col in missing:
-        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN `{col}` {desired[col]};")
-
-    if not index_exists(cur, "uniq_url"):
-        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_url (url(255));")
-
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_url (url(255)),
+      KEY idx_company_time (company, timestamp_utc),
+      KEY idx_time (timestamp_utc)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
     cur.close()
     cnx.close()
 
-def insert_rows_mysql(rows: list[dict]):
+def insert_rows_mysql(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
-
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
 
@@ -428,51 +328,148 @@ def insert_rows_mysql(rows: list[dict]):
       error=VALUES(error);
     """
 
-    values = []
+    vals = []
     for r in rows:
-        values.append((
-            r.get("cycle"),
-            iso_to_mysql_datetime(r.get("timestamp_utc")),
-            r.get("company"),
+        # timestamp_utc stored as DATETIME (naive UTC ok)
+        ts = r.get("timestamp_utc")
+        if isinstance(ts, str):
+            # If iso_z, remove Z and parse loosely
+            # Keep simple: MySQL connector accepts ISO strings for DATETIME in many setups.
+            ts_val = ts.replace("Z", "").replace("T", " ")
+        else:
+            ts_val = ts
 
+        pub = r.get("published_at")
+        if isinstance(pub, str):
+            pub_val = pub.replace("Z", "").replace("T", " ")
+        else:
+            pub_val = pub
+
+        vals.append((
+            r.get("cycle"),
+            ts_val,
+            r.get("company"),
             r.get("uuid"),
             r.get("source"),
-            r.get("published_at"),
+            pub_val,
             r.get("title"),
-            r.get("url") or "about:blank",
+            r.get("url"),
             r.get("description"),
             r.get("snippet"),
             r.get("image_url"),
-
             r.get("language"),
             r.get("categories"),
             r.get("locale"),
             r.get("relevance_score"),
-
             r.get("sentiment"),
             r.get("confidence_0_to_100"),
             r.get("one_sentence_summary"),
-
             r.get("market_direction"),
             r.get("market_time_horizon"),
             r.get("market_rationale"),
-
             r.get("elapsed_s"),
             r.get("prompt_tokens"),
             r.get("completion_tokens"),
             r.get("total_tokens"),
-
             r.get("analysis_json"),
             r.get("error"),
         ))
 
-    cur.executemany(sql, values)
+    cur.executemany(sql, vals)
     cur.close()
     cnx.close()
 
 
 # ----------------------------
-# Config + state builder
+# LLM analysis
+# ----------------------------
+def extract_json_object(text: str) -> Dict[str, Any]:
+    if not text or not text.strip():
+        raise ValueError("Empty model response")
+
+    raw = text.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError("Could not locate JSON in model output")
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(raw[start:i + 1])
+
+    raise ValueError("Found '{' but could not extract a complete JSON object")
+
+def build_prompt(article: dict) -> str:
+    schema = {
+        "sentiment": "positive|neutral|negative",
+        "confidence_0_to_100": 0,
+        "one_sentence_summary": "string",
+        "market_impact": {
+            "direction": "up|down|mixed|unclear",
+            "time_horizon": "intraday|days|weeks|months|unclear",
+            "rationale": "string"
+        }
+    }
+    return (
+        "Return ONLY valid JSON. No markdown.\n\n"
+        "You are a news analysis assistant. Use ONLY the provided article fields.\n"
+        "Do not invent facts. If insufficient, be neutral and say what is missing.\n\n"
+        f"Required JSON schema:\n{json.dumps(schema, indent=2)}\n\n"
+        "Article:\n"
+        f"{json.dumps(article, ensure_ascii=False)}"
+    )
+
+def analyze_article(client: OpenAI, model: str, article: dict) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    start = time.time()
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": build_prompt(article)}],
+        temperature=0.2,
+        max_tokens=650,
+        stream=False,
+    )
+    elapsed = time.time() - start
+    text = (resp.choices[0].message.content or "").strip()
+    parsed = extract_json_object(text)
+
+    usage = getattr(resp, "usage", None)
+    perf = {
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+        "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+        "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+    }
+    return parsed, perf
+
+
+# ----------------------------
+# Runtime builder
 # ----------------------------
 def load_config(config_path: Path = CONFIG_PATH) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
@@ -488,8 +485,24 @@ def build_runtime_from_config(cfg: dict) -> dict:
     fallback_idx = int(model_cfg.get("fallback_model_index", 3))
 
     companies = (cfg.get("query") or {}).get("companies") or []
-    if not companies:
-        raise RuntimeError("Config must include query.companies list.")
+
+    # NEW: tickers support
+    tickers_cfg = cfg.get("tickers") or {}
+    tickers_mode = (tickers_cfg.get("mode") or "").strip().lower()
+    tickers_track = tickers_cfg.get("track") or []
+    tickers: List[Dict[str, str]] = []
+    if tickers_mode == "explicit" and isinstance(tickers_track, list):
+        for t in tickers_track:
+            if not isinstance(t, dict):
+                continue
+            sym = normalize_ticker(t.get("ticker"))
+            if not sym:
+                continue
+            nm = strip_or_none(t.get("name")) or sym
+            tickers.append({"ticker": sym, "name": nm})
+
+    if not companies and not tickers:
+        raise RuntimeError("Config must include query.companies and/or tickers.track.")
 
     ensure_table_and_migrate()
 
@@ -502,7 +515,8 @@ def build_runtime_from_config(cfg: dict) -> dict:
         "client": client,
         "model": chosen_model,
         "companies": companies,
-        "seen": set(),  # in-memory dedupe
+        "tickers": tickers,          # NEW
+        "seen": set(),               # in-memory dedupe
         "last_poll": utc_now() - timedelta(minutes=lookback_minutes),
         "cycle": 0,
     }
@@ -512,6 +526,8 @@ def build_runtime_from_config(cfg: dict) -> dict:
 # ----------------------------
 # Public API for main.py
 # ----------------------------
+_STATE: Optional[dict] = None
+
 def run_once(state: Optional[dict] = None, config_path: Path = CONFIG_PATH) -> Tuple[int, datetime]:
     """
     One polling cycle:
@@ -532,13 +548,15 @@ def run_once(state: Optional[dict] = None, config_path: Path = CONFIG_PATH) -> T
     cfg = state["cfg"]
     client = state["client"]
     chosen_model = state["model"]
-    companies = state["companies"]
+    companies = state.get("companies") or []
+    tickers = state.get("tickers") or []      # NEW
     seen = state["seen"]
     last_poll = state["last_poll"]
 
     poll_end = utc_now()
     batch_rows: List[Dict[str, Any]] = []
 
+    # 1) Macro/company queries (existing behavior)
     for c in companies:
         company_name = c.get("display_name") or c.get("id") or "UNKNOWN"
         search = build_company_search(c)
@@ -587,6 +605,7 @@ def run_once(state: Optional[dict] = None, config_path: Path = CONFIG_PATH) -> T
                     "market_direction": (analysis.get("market_impact") or {}).get("direction"),
                     "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
                     "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
                     "completion_tokens": perf.get("completion_tokens"),
@@ -605,6 +624,83 @@ def run_once(state: Optional[dict] = None, config_path: Path = CONFIG_PATH) -> T
                     "title": a.get("title"),
                     "url": url or "about:blank",
                     "error": f"analysis_error: {e}",
+                })
+
+    # 2) Ticker queries (NEW behavior)
+    #    IMPORTANT: company column is set to the ticker symbol so ai.py can query WHERE company=%s using ticker.
+    for t in tickers:
+        ticker = normalize_ticker(t.get("ticker"))
+        name = strip_or_none(t.get("name")) or ticker
+        if not ticker:
+            continue
+
+        search = build_ticker_search(ticker=ticker, name=name)
+        if not search:
+            continue
+
+        try:
+            articles = fetch_thenewsapi(cfg=cfg, search=search, published_after=last_poll, published_before=poll_end)
+        except Exception as e:
+            batch_rows.append({
+                "cycle": state["cycle"],
+                "timestamp_utc": iso_z(utc_now()),
+                "company": ticker,            # ticker key
+                "url": "about:blank",
+                "error": f"fetch_error(ticker): {e}",
+            })
+            continue
+
+        for a in articles:
+            url = (a.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+
+            try:
+                analysis, perf = analyze_article(client, chosen_model, a)
+                batch_rows.append({
+                    "cycle": state["cycle"],
+                    "timestamp_utc": iso_z(utc_now()),
+                    "company": ticker,          # ticker key (so ai.py can find it)
+
+                    "uuid": a.get("uuid"),
+                    "source": a.get("source"),
+                    "published_at": a.get("published_at"),
+                    "title": a.get("title"),
+                    "url": url,
+                    "description": a.get("description"),
+                    "snippet": a.get("snippet"),
+                    "image_url": a.get("image_url"),
+                    "language": a.get("language"),
+                    "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
+                    "locale": a.get("locale"),
+                    "relevance_score": a.get("relevance_score"),
+
+                    "sentiment": analysis.get("sentiment"),
+                    "confidence_0_to_100": analysis.get("confidence_0_to_100"),
+                    "one_sentence_summary": analysis.get("one_sentence_summary"),
+                    "market_direction": (analysis.get("market_impact") or {}).get("direction"),
+                    "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
+                    "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+
+                    "elapsed_s": perf.get("elapsed_s"),
+                    "prompt_tokens": perf.get("prompt_tokens"),
+                    "completion_tokens": perf.get("completion_tokens"),
+                    "total_tokens": perf.get("total_tokens"),
+                    "analysis_json": json.dumps(analysis, ensure_ascii=False),
+                    "error": None,
+                })
+            except Exception as e:
+                batch_rows.append({
+                    "cycle": state["cycle"],
+                    "timestamp_utc": iso_z(utc_now()),
+                    "company": ticker,
+                    "uuid": a.get("uuid"),
+                    "source": a.get("source"),
+                    "published_at": a.get("published_at"),
+                    "title": a.get("title"),
+                    "url": url or "about:blank",
+                    "error": f"analysis_error(ticker): {e}",
                 })
 
     inserted = 0
@@ -637,18 +733,22 @@ def run_forever(config_path: Path = CONFIG_PATH):
             print(f"Reached iterations={iterations}. Exiting.")
             break
 
-        inserted, poll_end = run_once(state=state, config_path=config_path)
+        inserted, _poll_end = run_once(state=state, config_path=config_path)
         print(f"[{iso_z(utc_now())}] Cycle {state['cycle']}: inserted {inserted} rows -> {MYSQL_DB}.{MYSQL_TABLE}")
 
         if iterations is None or state["cycle"] < iterations:
-            time.sleep(interval_seconds)
+            time.sleep(int(interval_seconds))
 
 
 # ----------------------------
-# CLI main (unchanged behavior)
+# Entrypoint
 # ----------------------------
 def main():
-    run_forever(CONFIG_PATH)
+    cfg = load_config(CONFIG_PATH)
+    state = build_runtime_from_config(cfg)
+    state["cycle"] += 1
+    inserted, poll_end = run_once(state=state, config_path=CONFIG_PATH)
+    print(f"[{iso_z(poll_end)}] inserted={inserted} -> {MYSQL_DB}.{MYSQL_TABLE}")
 
 if __name__ == "__main__":
     main()
