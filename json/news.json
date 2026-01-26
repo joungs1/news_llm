@@ -1,0 +1,60 @@
+{
+  "polling": {
+    "interval_seconds": 120,
+    "lookback_minutes": 1440,
+    "language": "en",
+    "page_size": 50,
+    "iterations": null
+  },
+
+  "query": {
+    "mode": "everything",
+    "companies": [
+      {
+        "id": "macro",
+        "display_name": "Global Macro & Markets",
+        "keywords": [
+          "stocks",
+          "markets",
+          "economy",
+          "inflation",
+          "interest rates",
+          "central bank",
+          "earnings",
+          "IPO",
+          "M&A"
+        ]
+      }
+    ]
+  },
+
+  "sources": {
+    "mode": "domains",
+    "include": [
+      "reuters.com"
+    ],
+    "exclude": [
+      "reddit.com",
+      "twitter.com",
+      "x.com",
+      "facebook.com",
+      "medium.com",
+      "substack.com",
+      "blogspot.com",
+      "wordpress.com",
+      "youtube.com",
+      "tiktok.com"
+    ]
+  },
+
+  "model": {
+    "host": "http://100.88.217.85:11434",
+    "preferred_model": "phi3:latest",
+    "fallback_model_index": 3
+  },
+
+  "output": {
+    "file": "major_media_live_news.xlsx",
+    "dedupe_key": "url"
+  }
+}
