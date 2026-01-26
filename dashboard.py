@@ -4,12 +4,15 @@ from __future__ import annotations
 """
 MySQL-backed dashboard (Finance + News + AI) served over HTTP (Tailscale-friendly).
 
-Fixes included
-- Uses Finance.finance_ohlcv_cache column name: bar_interval (NOT interval)
-- Keeps API/UI parameter name "interval" for the client, but maps to bar_interval in SQL
-- Fixes Analyst panel field list to match your analyst_snapshot table columns
-- Adds simple /api/health for quick debugging
-- Strongly recommends using MYSQL_PASSWORD from env (but keeps your default to avoid breaking you)
+Adds (new):
+- Global news panel at the top (independent of selected ticker)
+  - Reads from your News table using a configured company key (default: "Global Macro & Markets")
+  - Endpoint: /api/global_news?date=YYYY-MM-DD
+  - UI block: "Global News (selected day)" above the chart + right panels
+
+Notes:
+- Ticker news remains ticker-scoped (your existing /api/news?company=<ticker>)
+- Finance uses Finance.finance_ohlcv_cache column name: bar_interval (NOT interval)
 """
 
 import os
@@ -47,12 +50,16 @@ MYSQL_TABLE_AI = os.getenv("MYSQL_TABLE_AI", "ai_recommendations")
 # Limits
 MAX_FINANCE_ROWS = int(os.getenv("MAX_FINANCE_ROWS", "2500"))
 NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "15"))
+GLOBAL_NEWS_LIMIT = int(os.getenv("GLOBAL_NEWS_LIMIT", "12"))
 ANALYST_EVENTS_LIMIT = int(os.getenv("ANALYST_EVENTS_LIMIT", "25"))
 
 USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
 
 # IMPORTANT: physical column name in Finance.finance_ohlcv_cache
 BARS_INTERVAL_COL = "bar_interval"
+
+# Global news "company" key in LLM.news_llm_analysis
+GLOBAL_NEWS_COMPANY = os.getenv("GLOBAL_NEWS_COMPANY", "Global Macro & Markets")
 
 # ============================================================
 # Flask app
@@ -158,7 +165,10 @@ def fetch_availability_for_ticker(ticker: str) -> Dict[str, List[str]]:
         if period not in availability[bar_interval]:
             availability[bar_interval].append(period)
 
-    period_rank = {"1d": 0, "5d": 1, "1mo": 2, "3mo": 3, "6mo": 4, "1y": 5, "2y": 6, "5y": 7, "10y": 8, "max": 99}
+    period_rank = {
+        "1d": 0, "5d": 1, "1mo": 2, "3mo": 3, "6mo": 4, "1y": 5,
+        "2y": 6, "5y": 7, "10y": 8, "max": 99
+    }
     for itv in availability:
         availability[itv].sort(key=lambda x: period_rank.get(x, 50))
     return availability
@@ -288,7 +298,7 @@ def fetch_analyst_block(ticker: str, d: date_cls) -> Dict[str, Any]:
 # ============================================================
 # News: same-day important items
 # ============================================================
-def fetch_news_block(company: str, d: date_cls) -> List[Dict[str, Any]]:
+def fetch_news_block(company: str, d: date_cls, limit: int = NEWS_LIMIT) -> List[Dict[str, Any]]:
     start_utc, end_utc = day_window(d)
 
     cnx = mysql_connect(MYSQL_DB_NEWS)
@@ -304,12 +314,21 @@ def fetch_news_block(company: str, d: date_cls) -> List[Dict[str, Any]]:
         ORDER BY timestamp_utc DESC
         LIMIT %s
         """,
-        (company, dt_utc_naive(start_utc), dt_utc_naive(end_utc), NEWS_LIMIT),
+        (company, dt_utc_naive(start_utc), dt_utc_naive(end_utc), int(limit)),
     )
     rows = cur.fetchall()
     cur.close()
     cnx.close()
     return safe_json(rows)
+
+
+def fetch_global_news_block(d: date_cls) -> Dict[str, Any]:
+    items = fetch_news_block(GLOBAL_NEWS_COMPANY, d, limit=GLOBAL_NEWS_LIMIT)
+    return {
+        "company": GLOBAL_NEWS_COMPANY,
+        "date": str(d),
+        "items": items,
+    }
 
 
 # ============================================================
@@ -364,7 +383,6 @@ def fetch_ai_block(ticker: str, d: date_cls) -> Optional[Dict[str, Any]]:
 # ============================================================
 @app.get("/api/health")
 def api_health():
-    # quick schema sanity checks for the common failure you hit
     try:
         ok = col_exists(MYSQL_DB_FINANCE, MYSQL_TABLE_BARS, BARS_INTERVAL_COL)
     except Exception as e:
@@ -377,6 +395,9 @@ def api_health():
             "bars_table": MYSQL_TABLE_BARS,
             "bars_interval_col": BARS_INTERVAL_COL,
             "bars_interval_col_exists": ok,
+            "news_db": MYSQL_DB_NEWS,
+            "news_table": MYSQL_TABLE_NEWS,
+            "global_news_company": GLOBAL_NEWS_COMPANY,
             "utc_day": USE_UTC_DAY,
         }
     )
@@ -427,8 +448,15 @@ def api_news():
     d = parse_yyyy_mm_dd(request.args.get("date"))
     if not company:
         return jsonify({"error": "missing company"}), 400
-    rows = fetch_news_block(company, d)
+    rows = fetch_news_block(company, d, limit=NEWS_LIMIT)
     return jsonify({"company": company, "date": str(d), "items": rows})
+
+
+@app.get("/api/global_news")
+def api_global_news():
+    d = parse_yyyy_mm_dd(request.args.get("date"))
+    payload = fetch_global_news_block(d)
+    return jsonify(payload)
 
 
 @app.get("/api/ai")
@@ -458,12 +486,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     label { font-size:12px; color:#444; }
     select, input[type="date"] { padding:7px 10px; border:1px solid #ccc; border-radius:8px; font-size:14px; }
     .status { margin-left:auto; font-size:12px; color:#555; max-width:720px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .layout { display:grid; grid-template-columns: 1.7fr 1fr; gap:14px; }
-    #chart { width:100%; height:900px; border:1px solid #eee; border-radius:12px; }
+
     .panel { border:1px solid #eee; border-radius:12px; padding:12px; }
     .panel h3 { margin:0 0 8px 0; font-size:14px; }
     .ai-line { font-size:13px; line-height:1.35; }
     .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; margin-right:6px; }
+
+    .layout { display:grid; grid-template-columns: 1.7fr 1fr; gap:14px; }
+    #chart { width:100%; height:900px; border:1px solid #eee; border-radius:12px; }
+
     .news-item { margin:10px 0; padding-bottom:10px; border-bottom:1px solid #eee; }
     .news-title { font-size:13px; font-weight:600; margin-bottom:4px; }
     .news-meta { font-size:12px; color:#666; margin-bottom:4px; }
@@ -471,10 +502,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     .small { font-size:12px; color:#666; }
     a { color:#0b5fff; text-decoration:none; }
     a:hover { text-decoration:underline; }
-    code { background:#f6f6f6; padding:2px 4px; border-radius:6px; }
   </style>
 </head>
 <body>
+
+  <div class="panel" style="margin-bottom:12px;">
+    <h3>Global News (selected day)</h3>
+    <div id="globalNewsBox" class="small">—</div>
+  </div>
 
   <div class="topbar">
     <div class="ctrl">
@@ -518,7 +553,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
 
       <div class="panel">
-        <h3>News (selected day)</h3>
+        <h3>Ticker News (selected day)</h3>
         <div id="newsBox" class="small">—</div>
       </div>
     </div>
@@ -534,6 +569,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   const elAI = document.getElementById("aiBox");
   const elAIMeta = document.getElementById("aiMeta");
   const elNews = document.getElementById("newsBox");
+  const elGlobalNews = document.getElementById("globalNewsBox");
   const elAnalyst = document.getElementById("analystBox");
 
   function setStatus(msg) { elStatus.textContent = msg; }
@@ -635,6 +671,32 @@ DASHBOARD_HTML = r"""<!doctype html>
     return {traces, layout};
   }
 
+  function escapeHtml(s) {
+    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  function renderNewsItems(containerEl, items, emptyMsg) {
+    if (!items || !items.length) {
+      containerEl.textContent = emptyMsg;
+      return;
+    }
+    containerEl.innerHTML = items.map(n => {
+      const title = n.title || "(no title)";
+      const url = n.url || "";
+      const source = n.source || "";
+      const ts = n.timestamp_utc || n.published_at || "";
+      const sent = n.sentiment || "";
+      const conf = (n.confidence_0_to_100 === null || n.confidence_0_to_100 === undefined) ? "" : ` (${n.confidence_0_to_100})`;
+      const sum = n.one_sentence_summary || "";
+      return `<div class="news-item">
+        <div class="news-title">${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>` : escapeHtml(title)}</div>
+        <div class="news-meta">${escapeHtml(source)} • ${escapeHtml(ts)} • ${escapeHtml(sent)}${escapeHtml(conf)}</div>
+        <div class="news-sum">${escapeHtml(sum)}</div>
+      </div>`;
+    }).join("");
+  }
+
   function renderAI(row) {
     if (!row) {
       elAI.innerHTML = "No AI recommendation found for this ticker on this date.";
@@ -648,8 +710,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     const asOf = row.as_of_utc || "—";
 
     elAI.innerHTML =
-      `<span class="pill">${stance}</span>` +
-      `<span class="pill">conf ${conf}</span>` +
+      `<span class="pill">${escapeHtml(stance)}</span>` +
+      `<span class="pill">conf ${escapeHtml(conf)}</span>` +
       `<div style="margin-top:8px;">${escapeHtml(rec)}</div>`;
     elAIMeta.textContent = `model=${model} | as_of_utc=${asOf}`;
   }
@@ -702,32 +764,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     elAnalyst.innerHTML = html;
   }
 
-  function renderNews(items) {
-    if (!items || !items.length) {
-      elNews.textContent = "No news rows found for this company on this date.";
-      return;
-    }
-    elNews.innerHTML = items.map(n => {
-      const title = n.title || "(no title)";
-      const url = n.url || "";
-      const source = n.source || "";
-      const ts = n.timestamp_utc || n.published_at || "";
-      const sent = n.sentiment || "";
-      const conf = (n.confidence_0_to_100 === null || n.confidence_0_to_100 === undefined) ? "" : ` (${n.confidence_0_to_100})`;
-      const sum = n.one_sentence_summary || "";
-      return `<div class="news-item">
-        <div class="news-title">${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>` : escapeHtml(title)}</div>
-        <div class="news-meta">${escapeHtml(source)} • ${escapeHtml(ts)} • ${escapeHtml(sent)}${escapeHtml(conf)}</div>
-        <div class="news-sum">${escapeHtml(sum)}</div>
-      </div>`;
-    }).join("");
-  }
-
-  function escapeHtml(s) {
-    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
-  }
-  function escapeAttr(s) { return escapeHtml(s); }
-
   async function refreshAvailabilityAndMenus() {
     const ticker = elTicker.value;
     const av = await apiGet(`/api/availability?ticker=${encodeURIComponent(ticker)}`);
@@ -751,6 +787,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     setStatus(`Loading: ${ticker} / ${interval} / ${period} / ${d} ...`);
 
     try {
+      // Global news (independent of ticker)
+      const g = await apiGet(`/api/global_news?date=${encodeURIComponent(d)}`);
+      renderNewsItems(elGlobalNews, g.items, "No global news rows found for this date.");
+
       const finance = await apiGet(`/api/finance?ticker=${encodeURIComponent(ticker)}&interval=${encodeURIComponent(interval)}&period=${encodeURIComponent(period)}&date=${encodeURIComponent(d)}`);
       const fig = buildFigure(finance);
       await Plotly.newPlot("chart", fig.traces, fig.layout, {responsive:true});
@@ -761,9 +801,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       const analyst = await apiGet(`/api/analyst?ticker=${encodeURIComponent(ticker)}&date=${encodeURIComponent(d)}`);
       renderAnalyst(analyst);
 
-      // NOTE: currently uses ticker as company key. If your news DB uses display names, adjust here.
+      // Ticker-only news (as requested)
       const news = await apiGet(`/api/news?company=${encodeURIComponent(ticker)}&date=${encodeURIComponent(d)}`);
-      renderNews(news.items);
+      renderNewsItems(elNews, news.items, "No ticker news rows found for this ticker on this date.");
 
       const m = finance.meta || {};
       setStatus(`Loaded ${m.ticker} — n=${m.n ?? "?"} — fetched=${m.fetched_at_utc ?? "?"}`);
@@ -777,10 +817,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     elDate.value = todayUTC_yyyy_mm_dd();
 
     // optional quick health ping
-    try {
-      const h = await apiGet("/api/health");
-      if (!h.ok) setStatus("Health check failed.");
-    } catch (e) {}
+    try { await apiGet("/api/health"); } catch (e) {}
 
     const t = await apiGet("/api/tickers");
     const tickers = t.tickers || [];
@@ -801,12 +838,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       await refreshAvailabilityAndMenus();
       await renderAll();
     });
-    elPeriod.addEventListener("change", async () => {
-      await renderAll();
-    });
-    elDate.addEventListener("change", async () => {
-      await renderAll();
-    });
+    elPeriod.addEventListener("change", async () => { await renderAll(); });
+    elDate.addEventListener("change", async () => { await renderAll(); });
   }
 
   init();
