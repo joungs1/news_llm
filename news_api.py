@@ -18,11 +18,11 @@ import mysql.connector
 # CONFIG
 # ============================================================
 
-THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "")
+THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 if not THENEWSAPI_TOKEN:
     # You hardcoded a token in your original snippet; keeping env-first is safer.
     # If you still want fallback, set it here.
-    THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "")
+    THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 
 # MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
