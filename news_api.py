@@ -1,14 +1,21 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import os
 import re
 import json
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
+
 from openai import OpenAI
 import mysql.connector
-from pathlib import Path
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
+
+# Repo root (adjust if your layout differs; parents[0] = folder containing this file)
 ROOT = Path(__file__).resolve().parents[1]          # repo root
 CONFIG_PATH = ROOT / "json" / "news.json"
 
@@ -20,25 +27,34 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
 MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
 
+
 # ----------------------------
 # Time helpers
 # ----------------------------
-def utc_now():
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def iso_to_mysql_datetime(iso_str: str | None):
+    """
+    Convert ISO8601 string (possibly ending with Z) to MySQL naive UTC DATETIME.
+    """
     if not iso_str:
         return None
     s = iso_str.replace("Z", "+00:00")
     dt = datetime.fromisoformat(s)
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
+# Backward-compatible alias (your insert_rows_mysql used this name, but it was missing)
+def iso_to_mysql_dt(iso_str: str | None):
+    return iso_to_mysql_datetime(iso_str)
+
 def thenewsapi_dt(dt: datetime) -> str:
     dt2 = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt2.strftime("%Y-%m-%dT%H:%M:%S")
+
 
 # ----------------------------
 # Ollama helpers
@@ -52,12 +68,13 @@ def list_ollama_models(ollama_host: str) -> list[str]:
 def pick_model(models: list[str], preferred: str, fallback_index: int) -> str:
     if not models:
         raise RuntimeError("No models found on the Ollama host.")
-    if preferred in models:
+    if preferred and preferred in models:
         return preferred
     idx = fallback_index - 1
     if 0 <= idx < len(models):
         return models[idx]
     return models[0]
+
 
 # ----------------------------
 # Query builder
@@ -69,6 +86,7 @@ def build_company_search(company_obj: dict) -> str:
         kws = [name] if name else []
     parts = [f"\"{k}\"" if " " in k else k for k in kws]
     return " | ".join(parts)
+
 
 # ----------------------------
 # TheNewsAPI fetch
@@ -126,6 +144,7 @@ def fetch_thenewsapi(cfg: dict, search: str, published_after: datetime, publishe
         hdrs = {k: v for k, v in r.headers.items() if "rate" in k.lower() or "usage" in k.lower()}
         raise RuntimeError(f"rate_limit_reached (429). headers={hdrs} body={r.text[:500]}")
     r.raise_for_status()
+
     data = r.json()
     if "error" in data:
         raise RuntimeError(f"TheNewsAPI error: {data.get('error')}")
@@ -149,6 +168,7 @@ def fetch_thenewsapi(cfg: dict, search: str, published_after: datetime, publishe
         })
     return out
 
+
 # ----------------------------
 # LLM helpers
 # ----------------------------
@@ -165,6 +185,7 @@ def extract_json_object(text: str) -> dict:
 
 def build_analysis_prompt(article: dict) -> str:
     def trunc(s: str, n: int) -> str:
+        s = s or ""
         return s if len(s) <= n else s[:n] + " ...[TRUNCATED]"
     return f"""
 Return ONLY valid JSON. No markdown.
@@ -212,6 +233,7 @@ def analyze_article(client: OpenAI, model: str, article: dict) -> tuple[dict, di
         "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
     }
     return parsed, perf
+
 
 # ----------------------------
 # MySQL helpers (auto-migrate)
@@ -306,10 +328,8 @@ def ensure_table_and_migrate():
         cnx.close()
         return
 
-    # If table exists, migrate missing columns
     existing = get_existing_columns(cur)
 
-    # Minimal set needed to fix your current error + future-proof inserts
     desired = {
         "cycle": "INT NULL",
         "timestamp_utc": "DATETIME NULL",
@@ -348,10 +368,7 @@ def ensure_table_and_migrate():
     for col in missing:
         cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN `{col}` {desired[col]};")
 
-    # Ensure UNIQUE index on url(255)
     if not index_exists(cur, "uniq_url"):
-        # If table already had duplicate URLs, this will fail.
-        # In that case, you need to dedupe first.
         cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_url (url(255));")
 
     cur.close()
@@ -422,13 +439,13 @@ def insert_rows_mysql(rows: list[dict]):
             r.get("source"),
             r.get("published_at"),
             r.get("title"),
-            r.get("url") or "about:blank",  # url is NOT NULL in our schema
+            r.get("url") or "about:blank",
             r.get("description"),
             r.get("snippet"),
             r.get("image_url"),
 
             r.get("language"),
-            r.get("categories"),  # JSON string or None
+            r.get("categories"),
             r.get("locale"),
             r.get("relevance_score"),
 
@@ -445,7 +462,7 @@ def insert_rows_mysql(rows: list[dict]):
             r.get("completion_tokens"),
             r.get("total_tokens"),
 
-            r.get("analysis_json"),  # JSON string or None
+            r.get("analysis_json"),
             r.get("error"),
         ))
 
@@ -453,24 +470,17 @@ def insert_rows_mysql(rows: list[dict]):
     cur.close()
     cnx.close()
 
-# ----------------------------
-# Main
-# ----------------------------
-def main():
-    if not THENEWSAPI_TOKEN:
-        raise RuntimeError("Set THENEWSAPI_TOKEN environment variable.")
-    if not MYSQL_USER or not MYSQL_PASSWORD:
-        raise RuntimeError("Set MYSQL_USER and MYSQL_PASSWORD environment variables (app login).")
 
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+# ----------------------------
+# Config + state builder
+# ----------------------------
+def load_config(config_path: Path = CONFIG_PATH) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
+def build_runtime_from_config(cfg: dict) -> dict:
     polling = cfg.get("polling", {}) or {}
-    interval_seconds = int(polling.get("interval_seconds", 60))
     lookback_minutes = int(polling.get("lookback_minutes", 30))
-    iterations = polling.get("iterations", None)
-    if iterations is not None:
-        iterations = int(iterations)
 
     model_cfg = cfg.get("model", {}) or {}
     ollama_host = model_cfg["host"]
@@ -481,105 +491,164 @@ def main():
     if not companies:
         raise RuntimeError("Config must include query.companies list.")
 
-    # Ensure table (and auto-migrate)
     ensure_table_and_migrate()
 
     models = list_ollama_models(ollama_host)
     chosen_model = pick_model(models, preferred_model, fallback_idx)
-    print(f"Using Ollama model: {chosen_model}")
     client = OpenAI(base_url=f"{ollama_host}/v1", api_key="ollama")
 
-    seen = set()
-    last_poll = utc_now() - timedelta(minutes=lookback_minutes)
+    state = {
+        "cfg": cfg,
+        "client": client,
+        "model": chosen_model,
+        "companies": companies,
+        "seen": set(),  # in-memory dedupe
+        "last_poll": utc_now() - timedelta(minutes=lookback_minutes),
+        "cycle": 0,
+    }
+    return state
 
-    cycle = 0
+
+# ----------------------------
+# Public API for main.py
+# ----------------------------
+def run_once(state: Optional[dict] = None, config_path: Path = CONFIG_PATH) -> Tuple[int, datetime]:
+    """
+    One polling cycle:
+      - fetch articles in [state.last_poll, now)
+      - analyze
+      - insert rows
+    Returns: (inserted_rows_count, poll_end_utc)
+    """
+    if not THENEWSAPI_TOKEN:
+        raise RuntimeError("Set THENEWSAPI_TOKEN environment variable.")
+    if not MYSQL_USER or not MYSQL_PASSWORD:
+        raise RuntimeError("Set MYSQL_USER and MYSQL_PASSWORD environment variables (app login).")
+
+    if state is None:
+        cfg = load_config(config_path)
+        state = build_runtime_from_config(cfg)
+
+    cfg = state["cfg"]
+    client = state["client"]
+    chosen_model = state["model"]
+    companies = state["companies"]
+    seen = state["seen"]
+    last_poll = state["last_poll"]
+
+    poll_end = utc_now()
+    batch_rows: List[Dict[str, Any]] = []
+
+    for c in companies:
+        company_name = c.get("display_name") or c.get("id") or "UNKNOWN"
+        search = build_company_search(c)
+
+        try:
+            articles = fetch_thenewsapi(cfg=cfg, search=search, published_after=last_poll, published_before=poll_end)
+        except Exception as e:
+            batch_rows.append({
+                "cycle": state["cycle"],
+                "timestamp_utc": iso_z(utc_now()),
+                "company": company_name,
+                "url": "about:blank",
+                "error": f"fetch_error: {e}",
+            })
+            continue
+
+        for a in articles:
+            url = (a.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+
+            try:
+                analysis, perf = analyze_article(client, chosen_model, a)
+                batch_rows.append({
+                    "cycle": state["cycle"],
+                    "timestamp_utc": iso_z(utc_now()),
+                    "company": company_name,
+
+                    "uuid": a.get("uuid"),
+                    "source": a.get("source"),
+                    "published_at": a.get("published_at"),
+                    "title": a.get("title"),
+                    "url": url,
+                    "description": a.get("description"),
+                    "snippet": a.get("snippet"),
+                    "image_url": a.get("image_url"),
+                    "language": a.get("language"),
+                    "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
+                    "locale": a.get("locale"),
+                    "relevance_score": a.get("relevance_score"),
+
+                    "sentiment": analysis.get("sentiment"),
+                    "confidence_0_to_100": analysis.get("confidence_0_to_100"),
+                    "one_sentence_summary": analysis.get("one_sentence_summary"),
+                    "market_direction": (analysis.get("market_impact") or {}).get("direction"),
+                    "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
+                    "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+                    "elapsed_s": perf.get("elapsed_s"),
+                    "prompt_tokens": perf.get("prompt_tokens"),
+                    "completion_tokens": perf.get("completion_tokens"),
+                    "total_tokens": perf.get("total_tokens"),
+                    "analysis_json": json.dumps(analysis, ensure_ascii=False),
+                    "error": None,
+                })
+            except Exception as e:
+                batch_rows.append({
+                    "cycle": state["cycle"],
+                    "timestamp_utc": iso_z(utc_now()),
+                    "company": company_name,
+                    "uuid": a.get("uuid"),
+                    "source": a.get("source"),
+                    "published_at": a.get("published_at"),
+                    "title": a.get("title"),
+                    "url": url or "about:blank",
+                    "error": f"analysis_error: {e}",
+                })
+
+    inserted = 0
+    if batch_rows:
+        insert_rows_mysql(batch_rows)
+        inserted = len(batch_rows)
+
+    # advance window
+    state["last_poll"] = poll_end
+    return inserted, poll_end
+
+
+def run_forever(config_path: Path = CONFIG_PATH):
+    """
+    Continuous runner (uses cfg.polling.interval_seconds and cfg.polling.iterations if present).
+    """
+    cfg = load_config(config_path)
+    polling = cfg.get("polling", {}) or {}
+    interval_seconds = int(polling.get("interval_seconds", 60))
+    iterations = polling.get("iterations", None)
+    if iterations is not None:
+        iterations = int(iterations)
+
+    state = build_runtime_from_config(cfg)
+    print(f"Using Ollama model: {state['model']}")
+
     while True:
-        cycle += 1
-        if iterations is not None and cycle > iterations:
+        state["cycle"] += 1
+        if iterations is not None and state["cycle"] > iterations:
             print(f"Reached iterations={iterations}. Exiting.")
             break
 
-        poll_end = utc_now()
-        batch_rows = []
+        inserted, poll_end = run_once(state=state, config_path=config_path)
+        print(f"[{iso_z(utc_now())}] Cycle {state['cycle']}: inserted {inserted} rows -> {MYSQL_DB}.{MYSQL_TABLE}")
 
-        for c in companies:
-            company_name = c.get("display_name") or c.get("id") or "UNKNOWN"
-            search = build_company_search(c)
-
-            try:
-                articles = fetch_thenewsapi(cfg=cfg, search=search, published_after=last_poll, published_before=poll_end)
-            except Exception as e:
-                batch_rows.append({
-                    "cycle": cycle,
-                    "timestamp_utc": iso_z(utc_now()),
-                    "company": company_name,
-                    "url": "about:blank",
-                    "error": f"fetch_error: {e}",
-                })
-                continue
-
-            for a in articles:
-                url = (a.get("url") or "").strip()
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-
-                try:
-                    analysis, perf = analyze_article(client, chosen_model, a)
-                    batch_rows.append({
-                        "cycle": cycle,
-                        "timestamp_utc": iso_z(utc_now()),
-                        "company": company_name,
-
-                        "uuid": a.get("uuid"),
-                        "source": a.get("source"),
-                        "published_at": a.get("published_at"),
-                        "title": a.get("title"),
-                        "url": url,
-                        "description": a.get("description"),
-                        "snippet": a.get("snippet"),
-                        "image_url": a.get("image_url"),
-                        "language": a.get("language"),
-                        "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
-                        "locale": a.get("locale"),
-                        "relevance_score": a.get("relevance_score"),
-
-                        "sentiment": analysis.get("sentiment"),
-                        "confidence_0_to_100": analysis.get("confidence_0_to_100"),
-                        "one_sentence_summary": analysis.get("one_sentence_summary"),
-                        "market_direction": (analysis.get("market_impact") or {}).get("direction"),
-                        "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
-                        "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
-                        "elapsed_s": perf.get("elapsed_s"),
-                        "prompt_tokens": perf.get("prompt_tokens"),
-                        "completion_tokens": perf.get("completion_tokens"),
-                        "total_tokens": perf.get("total_tokens"),
-                        "analysis_json": json.dumps(analysis, ensure_ascii=False),
-                        "error": None,
-                    })
-                except Exception as e:
-                    batch_rows.append({
-                        "cycle": cycle,
-                        "timestamp_utc": iso_z(utc_now()),
-                        "company": company_name,
-                        "uuid": a.get("uuid"),
-                        "source": a.get("source"),
-                        "published_at": a.get("published_at"),
-                        "title": a.get("title"),
-                        "url": url,
-                        "error": f"analysis_error: {e}",
-                    })
-
-        if batch_rows:
-            insert_rows_mysql(batch_rows)
-            print(f"[{iso_z(utc_now())}] Cycle {cycle}: inserted {len(batch_rows)} rows -> {MYSQL_DB}.{MYSQL_TABLE}")
-        else:
-            print(f"[{iso_z(utc_now())}] Cycle {cycle}: no rows")
-
-        last_poll = poll_end
-
-        if iterations is None or cycle < iterations:
+        if iterations is None or state["cycle"] < iterations:
             time.sleep(interval_seconds)
+
+
+# ----------------------------
+# CLI main (unchanged behavior)
+# ----------------------------
+def main():
+    run_forever(CONFIG_PATH)
 
 if __name__ == "__main__":
     main()
