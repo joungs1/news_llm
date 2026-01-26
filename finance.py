@@ -14,7 +14,7 @@ import mysql.connector
 # ============================================================
 # CONFIG
 # ============================================================
-WATCHLIST_JSON = os.getenv("json/finance.json")
+WATCHLIST_JSON = os.getenv("json/tickers.json")
 
 FETCH_PLAN: List[Tuple[str, List[str]]] = [
     ("5m",  ["1d", "5d", "1mo"]),
