@@ -4,29 +4,12 @@ from __future__ import annotations
 """
 MySQL-backed dashboard (Finance + News + AI) served over HTTP (Tailscale-friendly).
 
-What it does
-- Serves a single dashboard page at: /
-- Dashboard calls API endpoints on the same server:
-    /api/tickers
-    /api/availability?ticker=...
-    /api/finance?ticker=...&interval=...&period=...&date=YYYY-MM-DD
-    /api/analyst?ticker=...&date=YYYY-MM-DD
-    /api/news?company=...&date=YYYY-MM-DD
-    /api/ai?ticker=...&date=YYYY-MM-DD
-
-How to run (standalone)
-  pip install flask mysql-connector-python
-  export MYSQL_HOST=100.117.198.80
-  export MYSQL_USER=admin
-  export MYSQL_PASSWORD='...'
-  python dashboard.py --host 0.0.0.0 --port 8000
-
-How to run (from main.py)
-  import dashboard
-  dashboard.run_server(host="0.0.0.0", port=8000)
-
-Then open from another device via Tailscale:
-  http://<TAILSCALE_IP_OF_SERVER>:8000/
+Fixes included
+- Uses Finance.finance_ohlcv_cache column name: bar_interval (NOT interval)
+- Keeps API/UI parameter name "interval" for the client, but maps to bar_interval in SQL
+- Fixes Analyst panel field list to match your analyst_snapshot table columns
+- Adds simple /api/health for quick debugging
+- Strongly recommends using MYSQL_PASSWORD from env (but keeps your default to avoid breaking you)
 """
 
 import os
@@ -43,7 +26,9 @@ from flask import Flask, request, jsonify, Response
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")  # prefer env var in production
+
+# Prefer env var in production. Kept default to avoid breaking your current setup.
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
 
 # Finance DB
 MYSQL_DB_FINANCE = os.getenv("MYSQL_DB_FINANCE", "Finance")
@@ -65,6 +50,9 @@ NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "15"))
 ANALYST_EVENTS_LIMIT = int(os.getenv("ANALYST_EVENTS_LIMIT", "25"))
 
 USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
+
+# IMPORTANT: physical column name in Finance.finance_ohlcv_cache
+BARS_INTERVAL_COL = "bar_interval"
 
 # ============================================================
 # Flask app
@@ -103,7 +91,6 @@ def parse_yyyy_mm_dd(s: Optional[str]) -> date_cls:
 
 
 def day_window(d: date_cls) -> Tuple[datetime, datetime]:
-    # We standardize day selection in UTC for all DB comparisons.
     start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     return start, end
@@ -118,6 +105,23 @@ def safe_json(obj: Any) -> Any:
     if isinstance(obj, datetime):
         return iso_z(obj.replace(tzinfo=timezone.utc) if obj.tzinfo is None else obj)
     return obj
+
+
+def col_exists(db: str, table: str, col: str) -> bool:
+    cnx = mysql_connect(db)
+    cur = cnx.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s AND column_name=%s
+        """,
+        (db, table, col),
+    )
+    n = (cur.fetchone() or (0,))[0]
+    cur.close()
+    cnx.close()
+    return int(n) > 0
 
 
 # ============================================================
@@ -138,7 +142,7 @@ def fetch_availability_for_ticker(ticker: str) -> Dict[str, List[str]]:
     cur = cnx.cursor()
     cur.execute(
         f"""
-        SELECT DISTINCT interval, period
+        SELECT DISTINCT {BARS_INTERVAL_COL}, period
         FROM `{MYSQL_TABLE_BARS}`
         WHERE ticker=%s
         """,
@@ -149,12 +153,12 @@ def fetch_availability_for_ticker(ticker: str) -> Dict[str, List[str]]:
     cnx.close()
 
     availability: Dict[str, List[str]] = {}
-    for interval, period in rows:
-        availability.setdefault(interval, [])
-        if period not in availability[interval]:
-            availability[interval].append(period)
+    for bar_interval, period in rows:
+        availability.setdefault(bar_interval, [])
+        if period not in availability[bar_interval]:
+            availability[bar_interval].append(period)
 
-    period_rank = {"1d":0,"5d":1,"1mo":2,"3mo":3,"6mo":4,"1y":5,"2y":6,"5y":7,"10y":8,"max":99}
+    period_rank = {"1d": 0, "5d": 1, "1mo": 2, "3mo": 3, "6mo": 4, "1y": 5, "2y": 6, "5y": 7, "10y": 8, "max": 99}
     for itv in availability:
         availability[itv].sort(key=lambda x: period_rank.get(x, 50))
     return availability
@@ -167,22 +171,21 @@ def fetch_finance_series(
     d: date_cls,
 ) -> Dict[str, Any]:
     """
-    Returns payload compatible with your old cache_json format:
+    Returns:
       { meta: {...}, data: [ {t:"...", Open:..., ...}, ... ] }
     """
-    start_utc, end_utc = day_window(d)
+    _start_utc, end_utc = day_window(d)
 
     cnx = mysql_connect(MYSQL_DB_FINANCE)
     cur = cnx.cursor(dictionary=True)
 
-    # Show bars up to end of selected day (inclusive boundary via < end_utc)
     cur.execute(
         f"""
         SELECT ts_utc, open, high, low, close, volume,
                ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low,
                fetched_at_utc
         FROM `{MYSQL_TABLE_BARS}`
-        WHERE ticker=%s AND interval=%s AND period=%s
+        WHERE ticker=%s AND {BARS_INTERVAL_COL}=%s AND period=%s
           AND ts_utc < %s
         ORDER BY ts_utc DESC
         LIMIT %s
@@ -205,26 +208,29 @@ def fetch_finance_series(
         if fetched_at_dt and isinstance(fetched_at_dt, datetime):
             fetched_at = iso_z(fetched_at_dt.replace(tzinfo=timezone.utc))
 
-        data.append({
-            "t": t_iso,
-            "Open": r.get("open"),
-            "High": r.get("high"),
-            "Low": r.get("low"),
-            "Close": r.get("close"),
-            "Volume": r.get("volume"),
-            "EMA20": r.get("ema20"),
-            "VWAP": r.get("vwap"),
-            "RSI14": r.get("rsi14"),
-            "MACD_HIST": r.get("macd_hist"),
-            "BB_UP": r.get("bb_up"),
-            "BB_MID": r.get("bb_mid"),
-            "BB_LOW": r.get("bb_low"),
-        })
+        data.append(
+            {
+                "t": t_iso,
+                "Open": r.get("open"),
+                "High": r.get("high"),
+                "Low": r.get("low"),
+                "Close": r.get("close"),
+                "Volume": r.get("volume"),
+                "EMA20": r.get("ema20"),
+                "VWAP": r.get("vwap"),
+                "RSI14": r.get("rsi14"),
+                "MACD_HIST": r.get("macd_hist"),
+                "BB_UP": r.get("bb_up"),
+                "BB_MID": r.get("bb_mid"),
+                "BB_LOW": r.get("bb_low"),
+            }
+        )
 
+    start_utc, end_utc = day_window(d)
     payload = {
         "meta": {
             "ticker": ticker,
-            "interval": interval,
+            "interval": interval,  # UI name
             "period": period,
             "as_of_date": str(d),
             "day_window_utc": {"start": iso_z(start_utc), "end": iso_z(end_utc)},
@@ -356,6 +362,26 @@ def fetch_ai_block(ticker: str, d: date_cls) -> Optional[Dict[str, Any]]:
 # ============================================================
 # API ROUTES
 # ============================================================
+@app.get("/api/health")
+def api_health():
+    # quick schema sanity checks for the common failure you hit
+    try:
+        ok = col_exists(MYSQL_DB_FINANCE, MYSQL_TABLE_BARS, BARS_INTERVAL_COL)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify(
+        {
+            "ok": True,
+            "mysql": f"{MYSQL_HOST}:{MYSQL_PORT}",
+            "finance_db": MYSQL_DB_FINANCE,
+            "bars_table": MYSQL_TABLE_BARS,
+            "bars_interval_col": BARS_INTERVAL_COL,
+            "bars_interval_col_exists": ok,
+            "utc_day": USE_UTC_DAY,
+        }
+    )
+
+
 @app.get("/api/tickers")
 def api_tickers():
     tickers = fetch_tickers_from_finance()
@@ -445,6 +471,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .small { font-size:12px; color:#666; }
     a { color:#0b5fff; text-decoration:none; }
     a:hover { text-decoration:underline; }
+    code { background:#f6f6f6; padding:2px 4px; border-radius:6px; }
   </style>
 </head>
 <body>
@@ -486,7 +513,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
 
       <div class="panel" style="margin-bottom:14px;">
-        <h3>Analyst (snapshot + today events)</h3>
+        <h3>Analyst (latest snapshot + events in selected day)</h3>
         <div id="analystBox" class="small">—</div>
       </div>
 
@@ -635,17 +662,27 @@ DASHBOARD_HTML = r"""<!doctype html>
     let html = "";
     if (snap) {
       html += `<div><b>Latest snapshot</b></div>`;
-      const fields = ["as_of_utc", "recommendation", "rating", "target_mean", "target_high", "target_low",
-                      "number_of_analysts", "buy", "hold", "sell"];
+      const fields = [
+        ["as_of_utc","as_of_utc"],
+        ["recommendation_key","recommendation_key"],
+        ["recommendation_mean","recommendation_mean"],
+        ["num_analysts","num_analysts"],
+        ["target_mean","target_mean"],
+        ["target_high","target_high"],
+        ["target_low","target_low"],
+        ["sector","sector"],
+        ["industry","industry"],
+        ["paragraph","paragraph"],
+      ];
       html += `<div class="small">` + fields
-        .filter(f => snap[f] !== undefined && snap[f] !== null && String(snap[f]).length)
-        .map(f => `<div>${escapeHtml(f)}: ${escapeHtml(String(snap[f]))}</div>`)
+        .filter(([k,_]) => snap[k] !== undefined && snap[k] !== null && String(snap[k]).length)
+        .map(([k,label]) => `<div><b>${escapeHtml(label)}</b>: ${escapeHtml(String(snap[k]))}</div>`)
         .join("") + `</div>`;
     } else {
       html += `<div>No analyst snapshot in DB.</div>`;
     }
 
-    html += `<div style="margin-top:10px;"><b>Events in day</b> (n=${evs.length})</div>`;
+    html += `<div style="margin-top:10px;"><b>Events in selected day</b> (n=${evs.length})</div>`;
     if (!evs.length) {
       html += `<div class="small">No analyst events for this date.</div>`;
     } else {
@@ -697,11 +734,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     const availability = av.availability || {};
 
     const intervals = Object.keys(availability);
-    const pickedInterval = pickDefaultOrFirst(intervals, elInterval.value || "5m");
+    const pickedInterval = pickDefaultOrFirst(intervals, elInterval.value || "1d");
     buildOptions(elInterval, intervals, pickedInterval);
 
     const periods = (availability[elInterval.value] || []);
-    const pickedPeriod = pickDefaultOrFirst(periods, elPeriod.value || "1d");
+    const pickedPeriod = pickDefaultOrFirst(periods, elPeriod.value || "1mo");
     buildOptions(elPeriod, periods, pickedPeriod);
   }
 
@@ -739,6 +776,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   async function init() {
     elDate.value = todayUTC_yyyy_mm_dd();
 
+    // optional quick health ping
+    try {
+      const h = await apiGet("/api/health");
+      if (!h.ok) setStatus("Health check failed.");
+    } catch (e) {}
+
     const t = await apiGet("/api/tickers");
     const tickers = t.tickers || [];
     if (!tickers.length) {
@@ -772,7 +815,6 @@ DASHBOARD_HTML = r"""<!doctype html>
 </html>
 """
 
-
 @app.get("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html; charset=utf-8")
@@ -785,7 +827,6 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, debug: bool = False):
     """
     main.py expects dashboard.run_server(...)
     """
-    # Minimal connectivity check (fails fast)
     try:
         cnx = mysql_connect()
         cnx.close()
