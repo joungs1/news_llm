@@ -8,7 +8,7 @@ from openai import OpenAI
 import mysql.connector
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
-CONFIG_PATH = os.getenv("CONFIG_PATH", "json/news.json")
+CONFIG_PATH = ROOT / "json" / "news.json"
 
 # MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
