@@ -57,6 +57,10 @@ SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
 RETRY_ON_BAD_JSON = os.getenv("RETRY_ON_BAD_JSON", "1").strip() == "1"
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek-r1:latest")
 
+# If your Ollama OpenAI-compatible server supports response_format JSON mode.
+# If not supported, the code auto-falls back.
+FORCE_JSON_MODE = os.getenv("FORCE_JSON_MODE", "1").strip() == "1"
+
 
 # ============================================================
 # TIME HELPERS
@@ -238,7 +242,10 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# FINANCE BARS: SCHEMA-AWARE FILTERING (fixes column-name mismatch)
+# FINANCE BARS: SCHEMA-AWARE FILTERING
+#   Fixes:
+#   - reserved keyword interval
+#   - missing interval/period columns
 # ============================================================
 
 _BARS_FILTER_COLS: Optional[Dict[str, Optional[str]]] = None
@@ -255,6 +262,7 @@ def detect_bars_filter_cols() -> Dict[str, Optional[str]]:
     cur.close()
     cnx.close()
 
+    # Try a few common names
     interval_candidates = ["interval", "bar_interval", "timeframe", "tf"]
     period_candidates = ["period", "lookback_period", "window", "range_name"]
 
@@ -338,31 +346,38 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
 
 # ============================================================
 # JSON EXTRACTION (ROBUST)
+#   Also handles:
+#   - leading/trailing junk
+#   - multiple JSON objects: we take first complete object
 # ============================================================
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    if not text:
+    if not text or not text.strip():
         raise ValueError("Empty model response")
 
+    raw = text.strip()
+
+    # If the model returned valid JSON, return immediately
     try:
-        return json.loads(text)
+        return json.loads(raw)
     except Exception:
         pass
 
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```\s*$", "", cleaned).strip()
+    # Remove code fences
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
 
-    start = cleaned.find("{")
+    # Find first balanced JSON object
+    start = raw.find("{")
     if start == -1:
         raise ValueError("Could not locate JSON in model output")
 
     depth = 0
     in_str = False
     esc = False
-    for i in range(start, len(cleaned)):
-        ch = cleaned[i]
+    for i in range(start, len(raw)):
+        ch = raw[i]
         if in_str:
             if esc:
                 esc = False
@@ -378,13 +393,18 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return json.loads(cleaned[start:i+1])
+                    candidate = raw[start:i+1].strip()
+                    return json.loads(candidate)
 
     raise ValueError("Found '{' but could not extract a complete JSON object")
 
 
 # ============================================================
 # LLM (OpenAI-compatible via Ollama)
+#   Improvements:
+#   - temperature=0
+#   - attempt JSON mode (response_format) if supported
+#   - if parsing fails, we still store a neutral fallback rec
 # ============================================================
 
 def build_prompt(packet: Dict[str, Any]) -> str:
@@ -405,24 +425,50 @@ def build_prompt(packet: Dict[str, Any]) -> str:
         f"{json.dumps(packet, ensure_ascii=False)}"
     )
 
+def neutral_fallback(reason: str) -> Dict[str, Any]:
+    return {
+        "stance": "neutral",
+        "confidence_0_to_100": 10,
+        "recommendation_sentence": f"Neutral due to insufficient/invalid model output: {reason}",
+        "key_drivers": ["Insufficient structured signal from inputs"],
+        "risks": ["Model output parsing failure or missing data"],
+        "what_to_watch_next": ["Verify bars/news ingestion and enable JSON-mode output if supported"],
+    }
+
 def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str, Any]:
-    resp = client.chat.completions.create(
+    kwargs: Dict[str, Any] = dict(
         model=model,
         messages=[{"role": "user", "content": build_prompt(packet)}],
-        temperature=0.2,
+        temperature=0.0,
         max_tokens=650,
         stream=False,
     )
-    text = resp.choices[0].message.content or ""
+
+    # Try JSON mode if supported by your Ollama OpenAI-compatible endpoint
+    if FORCE_JSON_MODE:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    resp = client.chat.completions.create(**kwargs)
+    text = (resp.choices[0].message.content or "").strip()
     return extract_json_object(text)
 
-def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Optional[str]]:
+    """
+    Returns (output, used_model, note)
+    """
     try:
-        return run_llm_once(client, model, packet), model
-    except Exception as e:
+        out = run_llm_once(client, model, packet)
+        return out, model, None
+    except Exception as e1:
         if not RETRY_ON_BAD_JSON or not FALLBACK_MODEL:
             raise
-        return run_llm_once(client, FALLBACK_MODEL, packet), FALLBACK_MODEL
+        try:
+            out = run_llm_once(client, FALLBACK_MODEL, packet)
+            return out, FALLBACK_MODEL, f"primary_failed: {type(e1).__name__}: {e1}"
+        except Exception as e2:
+            # Both failed: return neutral fallback so dashboard still has a rec_sentence
+            reason = f"primary={type(e1).__name__}: {e1}; fallback={type(e2).__name__}: {e2}"
+            return neutral_fallback(reason), model, reason
 
 
 # ============================================================
@@ -432,9 +478,6 @@ def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str,
 _STATE: Optional[Dict[str, Any]] = None
 
 def build_state() -> Dict[str, Any]:
-    """
-    Build reusable state for repeated run_once() calls from main.py.
-    """
     ensure_ai_db_and_table()
     client = OpenAI(base_url=OPENAI_BASE, api_key="ollama")
     return {
@@ -443,14 +486,19 @@ def build_state() -> Dict[str, Any]:
         "cycle": 0,
     }
 
-def run_once() -> Dict[str, Any]:
+def run_once(
+    *,
+    run_date: Optional[date_cls] = None,
+    tickers: Optional[List[str]] = None,
+    max_tickers: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Called by main.py on a schedule.
     One cycle:
       - load watchlist
       - fetch finance bars + same-day news (optional)
       - run LLM
       - upsert result to AI.ai_recommendations
+
     Returns a summary dict for logging.
     """
     global _STATE
@@ -460,13 +508,21 @@ def run_once() -> Dict[str, Any]:
     _STATE["cycle"] += 1
     client: OpenAI = _STATE["client"]
 
-    start_utc, end_utc = day_window_for_date()
+    start_utc, end_utc = day_window_for_date(run_date)
     run_date_val = start_utc.date()
     as_of = dt_utc_naive(utc_now())
 
     watch = load_watchlist(Path(_STATE["watchlist_path"]))
     if not watch:
         raise RuntimeError(f"No tickers found in: {_STATE['watchlist_path']}")
+
+    # optional filter
+    if tickers is not None:
+        wanted = {normalize_ticker(t) for t in tickers}
+        watch = [w for w in watch if w["ticker"] in wanted]
+
+    if max_tickers is not None:
+        watch = watch[: int(max_tickers)]
 
     saved_ok = 0
     saved_err = 0
@@ -479,6 +535,7 @@ def run_once() -> Dict[str, Any]:
         try:
             bars = fetch_finance_bars(ticker)
 
+            # News may be empty; your news pipeline currently is macro-scoped.
             news = fetch_news_in_window(name, start_utc, end_utc)
             if not news and name != ticker:
                 news = fetch_news_in_window(ticker, start_utc, end_utc)
@@ -499,7 +556,7 @@ def run_once() -> Dict[str, Any]:
                 "news_in_window": news,
             }
 
-            out, used_model = run_llm_with_optional_fallback(client, DEFAULT_MODEL, packet)
+            out, used_model, note = run_llm_with_optional_fallback(client, DEFAULT_MODEL, packet)
 
             row = {
                 "run_date": run_date_val,
@@ -517,9 +574,14 @@ def run_once() -> Dict[str, Any]:
                     "bars_period": BARS_PERIOD,
                     "news_count": len(news or []),
                     "bars_filter_cols": _BARS_FILTER_COLS,
-                    "models": {"primary": DEFAULT_MODEL, "fallback": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None},
+                    "models": {
+                        "primary": DEFAULT_MODEL,
+                        "fallback": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None,
+                        "json_mode_requested": FORCE_JSON_MODE,
+                    },
+                    "note": note,
                 },
-                "error": None,
+                "error": None if (note is None or "Neutral due" in (out.get("recommendation_sentence") or "")) else None,
             }
 
             upsert_ai_row(row)
@@ -535,10 +597,10 @@ def run_once() -> Dict[str, Any]:
                 "ticker": ticker,
                 "company_name": name,
                 "model": DEFAULT_MODEL,
-                "stance": None,
-                "confidence_0_to_100": None,
-                "recommendation_sentence": None,
-                "simplified": None,
+                "stance": "neutral",
+                "confidence_0_to_100": 10,
+                "recommendation_sentence": f"Neutral due to pipeline error: {err}",
+                "simplified": neutral_fallback(err),
                 "input_digest": {"bars_filter_cols": _BARS_FILTER_COLS},
                 "error": err,
             }
