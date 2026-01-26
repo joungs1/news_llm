@@ -19,12 +19,14 @@ import mysql.connector
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 
+# MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
 MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
+
 
 # repo root heuristic
 ROOT = Path(__file__).resolve().parents[1]
