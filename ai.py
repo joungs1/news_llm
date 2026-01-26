@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "news_llm" / "json" / "tickers.json")))
 
 # --- Ollama (remote) ---
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.88.217.85:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.72.98.127:11434")
 OPENAI_BASE = f"{OLLAMA_HOST}/v1"
 
 # Preferred default model for this workflow:
