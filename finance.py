@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
@@ -16,15 +17,10 @@ import mysql.connector
 # ============================================================
 # REPO PATHS
 # ============================================================
-# Assumption: this file lives in repo root OR repo/src/.
-# If your finance.py is in repo root -> parents[0] is repo root
-# If your finance.py is in repo/src/ -> parents[1] is repo root
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[1] if (THIS_FILE.parent.name in {"src", "scripts"}) else THIS_FILE.parents[0]
-
 WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "json" / "tickers.json")))
 
-# Sleep between remote calls (yfinance)
 SLEEP_BETWEEN_REQUESTS_S = float(os.getenv("SLEEP_BETWEEN_REQUESTS_S", "0.25"))
 
 # ============================================================
@@ -50,9 +46,24 @@ MYSQL_TABLE_BARS = os.getenv("MYSQL_TABLE_FINANCE", "finance_ohlcv_cache")
 MYSQL_TABLE_ANALYST_SNAPSHOT = os.getenv("MYSQL_TABLE_ANALYST_SNAPSHOT", "analyst_snapshot")
 MYSQL_TABLE_ANALYST_EVENTS = os.getenv("MYSQL_TABLE_ANALYST_EVENTS", "analyst_events")
 
-# IMPORTANT:
-# We store interval in DB column `bar_interval` (NOT `interval`) to avoid SQL parsing/reserved-word issues.
+# We store interval in DB column `bar_interval` (NOT `interval`)
 DB_INTERVAL_COL = "bar_interval"
+
+# ============================================================
+# QUALITY FLAGS (bitmask for imputations)
+# ============================================================
+IMPUTE_OPEN      = 1 << 0
+IMPUTE_HIGH      = 1 << 1
+IMPUTE_LOW       = 1 << 2
+IMPUTE_CLOSE     = 1 << 3
+IMPUTE_VOLUME    = 1 << 4
+IMPUTE_EMA20     = 1 << 5
+IMPUTE_VWAP      = 1 << 6
+IMPUTE_RSI14     = 1 << 7
+IMPUTE_MACD_HIST = 1 << 8
+IMPUTE_BB_UP     = 1 << 9
+IMPUTE_BB_MID    = 1 << 10
+IMPUTE_BB_LOW    = 1 << 11
 
 # ============================================================
 # INDICATORS
@@ -99,7 +110,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ============================================================
 # WATCHLIST JSON
-# Expect: [{"Potential":"RBC","Ticker":"RY.TO"}, ...]
 # ============================================================
 def normalize_ticker(raw: Any) -> str:
     if raw is None:
@@ -124,7 +134,6 @@ def load_tickers_from_watchlist_json(path: Path) -> List[str]:
             t = normalize_ticker(row.get("Ticker", ""))
             if t:
                 tickers.append(t)
-    # dedupe preserve order
     seen, out = set(), []
     for t in tickers:
         if t not in seen:
@@ -154,7 +163,8 @@ def fetch_ohlcv(ticker: str, interval: str, period: str) -> pd.DataFrame:
     if any(c not in df.columns for c in required):
         return pd.DataFrame()
 
-    return df.dropna(subset=required).copy()
+    # Do NOT drop rows here; we will impute later and mark status.
+    return df.copy()
 
 # ============================================================
 # YFINANCE: ANALYST DATA
@@ -257,8 +267,22 @@ def mysql_connect(db: str | None = None):
         cfg["database"] = db
     return mysql.connector.connect(**cfg)
 
+def _column_exists(cur, db: str, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s AND column_name=%s
+        """,
+        (db, table, col),
+    )
+    return (cur.fetchone() or [0])[0] > 0
+
+def _ensure_column(cur, db: str, table: str, col: str, ddl: str):
+    if not _column_exists(cur, db, table, col):
+        cur.execute(f"ALTER TABLE `{table}` ADD COLUMN {ddl}")
+
 def ensure_db_and_tables():
-    # DB
     cnx = mysql_connect()
     cur = cnx.cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
@@ -268,7 +292,7 @@ def ensure_db_and_tables():
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
 
-    # OHLCV bars table (NOTE: bar_interval)
+    # OHLCV bars table
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE_BARS}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -300,6 +324,12 @@ def ensure_db_and_tables():
       KEY idx_ticker (ticker)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+
+    # Add quality/status columns if missing (safe migration)
+    _ensure_column(cur, MYSQL_DB, MYSQL_TABLE_BARS, "row_status", "row_status VARCHAR(16) NULL")
+    _ensure_column(cur, MYSQL_DB, MYSQL_TABLE_BARS, "impute_mask", "impute_mask BIGINT UNSIGNED NULL")
+    _ensure_column(cur, MYSQL_DB, MYSQL_TABLE_BARS, "error_code", "error_code VARCHAR(64) NULL")
+    _ensure_column(cur, MYSQL_DB, MYSQL_TABLE_BARS, "error_detail", "error_detail TEXT NULL")
 
     # Analyst snapshot table
     cur.execute(f"""
@@ -369,7 +399,9 @@ def ensure_db_and_tables():
     cnx.close()
 
 def to_mysql_dt(ts) -> Optional[datetime]:
-    if ts is None or (isinstance(ts, float) and np.isnan(ts)):
+    if ts is None:
+        return None
+    if isinstance(ts, float) and (math.isnan(ts) or math.isinf(ts)):
         return None
     if isinstance(ts, str):
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -387,28 +419,95 @@ def to_mysql_dt(ts) -> Optional[datetime]:
         return dt.replace(tzinfo=None)
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
-def n2(v):
-    if v is None:
+def f2(v) -> Optional[float]:
+    """Return float or None, handling numpy/pandas/NaN/inf safely."""
+    if v is None or v is pd.NA:
         return None
-    if isinstance(v, (np.floating, np.integer)):
-        return v.item()
-    if isinstance(v, float) and np.isnan(v):
+    if isinstance(v, (np.floating, np.integer, np.bool_)):
+        v = v.item()
+    try:
+        fv = float(v)
+    except Exception:
         return None
-    return v
+    if math.isnan(fv) or math.isinf(fv):
+        return None
+    return fv
+
+def i2(v) -> Optional[int]:
+    fv = f2(v)
+    if fv is None:
+        return None
+    try:
+        iv = int(fv)
+    except Exception:
+        return None
+    return iv
+
+def sanitize_row(row: pd.Series) -> Tuple[Dict[str, Any], int, str, Optional[str], Optional[str]]:
+    """
+    Returns:
+      clean_values dict (Open/High/Low/Close/Volume + indicators),
+      impute_mask,
+      row_status ('OK' or 'IMPUTED'),
+      error_code (None),
+      error_detail (None)
+    """
+    impute_mask = 0
+
+    def get_num(col: str, bit: int, default: float = 0.0) -> float:
+        nonlocal impute_mask
+        v = f2(row.get(col))
+        if v is None:
+            impute_mask |= bit
+            return float(default)
+        return float(v)
+
+    def get_int(col: str, bit: int, default: int = 0) -> int:
+        nonlocal impute_mask
+        v = i2(row.get(col))
+        if v is None:
+            impute_mask |= bit
+            return int(default)
+        # Clamp negatives (bad feeds sometimes)
+        if v < 0:
+            impute_mask |= bit
+            return int(default)
+        return int(v)
+
+    clean = {
+        "Open": get_num("Open", IMPUTE_OPEN, 0.0),
+        "High": get_num("High", IMPUTE_HIGH, 0.0),
+        "Low": get_num("Low", IMPUTE_LOW, 0.0),
+        "Close": get_num("Close", IMPUTE_CLOSE, 0.0),
+        "Volume": get_int("Volume", IMPUTE_VOLUME, 0),
+        "EMA20": get_num("EMA20", IMPUTE_EMA20, 0.0),
+        "VWAP": get_num("VWAP", IMPUTE_VWAP, 0.0),
+        "RSI14": get_num("RSI14", IMPUTE_RSI14, 0.0),
+        "MACD_HIST": get_num("MACD_HIST", IMPUTE_MACD_HIST, 0.0),
+        "BB_UP": get_num("BB_UP", IMPUTE_BB_UP, 0.0),
+        "BB_MID": get_num("BB_MID", IMPUTE_BB_MID, 0.0),
+        "BB_LOW": get_num("BB_LOW", IMPUTE_BB_LOW, 0.0),
+    }
+
+    status = "OK" if impute_mask == 0 else "IMPUTED"
+    return clean, impute_mask, status, None, None
 
 # ============================================================
-# INSERT/UPSERT: OHLCV BARS
+# INSERT/UPSERT: OHLCV BARS (robust)
 # ============================================================
 def upsert_bars(ticker: str, interval: str, period: str, df: pd.DataFrame) -> int:
     if df is None or df.empty:
         return 0
 
+    # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
 
-    df = df.dropna(axis=0, subset=["Open", "High", "Low", "Close", "Volume"]).copy()
-    if df.empty:
-        return 0
+    # Coerce numeric columns so weird object dtypes don't propagate
+    num_cols = ["Open","High","Low","Close","Volume","EMA20","VWAP","RSI14","MACD_HIST","BB_UP","BB_MID","BB_LOW"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -417,12 +516,14 @@ def upsert_bars(ticker: str, interval: str, period: str, df: pd.DataFrame) -> in
       ticker, {DB_INTERVAL_COL}, period, ts_utc,
       open, high, low, close, volume,
       ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low,
-      fetched_at_utc
+      fetched_at_utc,
+      row_status, impute_mask, error_code, error_detail
     ) VALUES (
       %s, %s, %s, %s,
       %s, %s, %s, %s, %s,
       %s, %s, %s, %s, %s, %s, %s,
-      %s
+      %s,
+      %s, %s, %s, %s
     )
     ON DUPLICATE KEY UPDATE
       open=VALUES(open),
@@ -437,35 +538,69 @@ def upsert_bars(ticker: str, interval: str, period: str, df: pd.DataFrame) -> in
       bb_up=VALUES(bb_up),
       bb_mid=VALUES(bb_mid),
       bb_low=VALUES(bb_low),
-      fetched_at_utc=VALUES(fetched_at_utc);
+      fetched_at_utc=VALUES(fetched_at_utc),
+      row_status=VALUES(row_status),
+      impute_mask=VALUES(impute_mask),
+      error_code=VALUES(error_code),
+      error_detail=VALUES(error_detail);
     """
 
     values = []
+    skipped_ts = 0
+
     for ts, row in df.iterrows():
         ts_utc = to_mysql_dt(ts)
         if ts_utc is None:
+            skipped_ts += 1
             continue
 
-        vol = row.get("Volume")
-        vol_val = int(vol) if pd.notna(vol) else None
+        clean, mask, status, err_code, err_detail = sanitize_row(row)
 
         values.append((
             ticker, interval, period, ts_utc,
-            n2(row.get("Open")), n2(row.get("High")), n2(row.get("Low")), n2(row.get("Close")), vol_val,
-            n2(row.get("EMA20")), n2(row.get("VWAP")), n2(row.get("RSI14")), n2(row.get("MACD_HIST")),
-            n2(row.get("BB_UP")), n2(row.get("BB_MID")), n2(row.get("BB_LOW")),
-            now_utc
+            clean["Open"], clean["High"], clean["Low"], clean["Close"], clean["Volume"],
+            clean["EMA20"], clean["VWAP"], clean["RSI14"], clean["MACD_HIST"],
+            clean["BB_UP"], clean["BB_MID"], clean["BB_LOW"],
+            now_utc,
+            status, int(mask), err_code, err_detail
         ))
 
     if not values:
         return 0
 
+    # Bulk insert, but if something weird still fails, fall back to per-row
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
-    cur.executemany(sql, values)
-    cur.close()
-    cnx.close()
-    return len(values)
+
+    try:
+        cur.executemany(sql, values)
+        cur.close()
+        cnx.close()
+        return len(values)
+    except Exception as bulk_err:
+        # Per-row salvage: keep pipeline going and record ERROR rows
+        ok = 0
+        for v in values:
+            try:
+                cur.execute(sql, v)
+                ok += 1
+            except Exception as row_err:
+                # Try to write an ERROR version of that same row (still keeps continuity)
+                try:
+                    v_err = list(v)
+                    v_err[-4] = "ERROR"                      # row_status
+                    v_err[-3] = int(v_err[-3] or 0)          # impute_mask
+                    v_err[-2] = "MYSQL_ROW_ERROR"            # error_code
+                    v_err[-1] = f"{type(row_err).__name__}: {row_err}"[:8000]  # error_detail
+                    cur.execute(sql, tuple(v_err))
+                    ok += 1
+                except Exception:
+                    # If even that fails, skip only this row
+                    pass
+
+        cur.close()
+        cnx.close()
+        return ok
 
 # ============================================================
 # INSERT: ANALYST SNAPSHOT
@@ -516,11 +651,11 @@ def insert_analyst_snapshot(snapshot: Dict[str, Any]) -> int:
         as_of,
         snapshot.get("ticker"),
         s.get("recommendationKey"),
-        n2(s.get("recommendationMean")),
+        f2(s.get("recommendationMean")),
         int(s.get("numberOfAnalystOpinions")) if s.get("numberOfAnalystOpinions") is not None else None,
-        n2(s.get("targetMeanPrice")),
-        n2(s.get("targetHighPrice")),
-        n2(s.get("targetLowPrice")),
+        f2(s.get("targetMeanPrice")),
+        f2(s.get("targetHighPrice")),
+        f2(s.get("targetLowPrice")),
         c.get("shortName"),
         c.get("longName"),
         c.get("sector"),
@@ -629,7 +764,7 @@ def insert_analyst_events(ticker: str, events: List[Dict[str, Any]]) -> int:
     return len(values)
 
 # ============================================================
-# ORCHESTRATION HELPERS (run_once / run_forever)
+# ORCHESTRATION HELPERS
 # ============================================================
 def load_config(watchlist_path: Path = WATCHLIST_JSON) -> Dict[str, Any]:
     tickers = load_tickers_from_watchlist_json(watchlist_path)
@@ -660,12 +795,6 @@ def run_once(
     do_bars: bool = True,
     max_tickers: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    One full cycle over tickers:
-      - optional analyst snapshot + events per ticker
-      - optional OHLCV+indicators upsert per interval/period
-    Returns summary dict (for logging).
-    """
     if state is None:
         state = build_state(None, watchlist_path)
 
@@ -683,7 +812,6 @@ def run_once(
     errors: List[str] = []
 
     for ticker in tickers:
-        # Analyst
         if do_analyst:
             try:
                 analyst = fetch_analyst_data(ticker)
@@ -693,11 +821,10 @@ def run_once(
                 total_snapshots += 1
                 total_events += insert_analyst_events(ticker, events)
             except Exception as e:
-                errors.append(f"ANALYST_ERR {ticker}: {e}")
+                errors.append(f"ANALYST_ERR {ticker}: {type(e).__name__}: {e}")
             if sleep_s:
                 time.sleep(sleep_s)
 
-        # Bars
         if do_bars:
             for interval, periods in fetch_plan:
                 for period in periods:
@@ -708,7 +835,8 @@ def run_once(
                         df2 = compute_indicators(df)
                         total_bars += upsert_bars(ticker, interval, period, df2)
                     except Exception as e:
-                        errors.append(f"BARS_ERR {ticker} {interval} {period}: {e}")
+                        # keep moving; do not break the cycle
+                        errors.append(f"BARS_ERR {ticker} {interval} {period}: {type(e).__name__}: {e}")
                     if sleep_s:
                         time.sleep(sleep_s)
 
@@ -736,7 +864,7 @@ def run_forever(
         time.sleep(int(interval_seconds))
 
 # ============================================================
-# SCRIPT MAIN (keeps your original behavior)
+# SCRIPT MAIN
 # ============================================================
 def main():
     tickers = load_tickers_from_watchlist_json(WATCHLIST_JSON)
@@ -753,7 +881,7 @@ def main():
     for ticker in tickers:
         print(f"\n=== {ticker} ===")
 
-        # Analyst: snapshot + events
+        # Analyst
         try:
             analyst = fetch_analyst_data(ticker)
             snapshot = analyst["snapshot"]
@@ -767,11 +895,11 @@ def main():
             total_events += n_ev
             print(f"  [ANALYST_EVENTS] inserted/upserted: {n_ev}")
         except Exception as e:
-            print(f"  [ANALYST_ERR] {ticker}: {e}")
+            print(f"  [ANALYST_ERR] {ticker}: {type(e).__name__}: {e}")
 
         time.sleep(SLEEP_BETWEEN_REQUESTS_S)
 
-        # OHLCV + indicators
+        # Bars
         for interval, periods in FETCH_PLAN:
             for period in periods:
                 try:
@@ -784,7 +912,7 @@ def main():
                     total_bars += n
                     print(f"  [BARS]   {interval} {period} -> upserted {n} rows")
                 except Exception as e:
-                    print(f"  [BARS_ERR] {interval} {period}: {e}")
+                    print(f"  [BARS_ERR] {interval} {period}: {type(e).__name__}: {e}")
 
                 time.sleep(SLEEP_BETWEEN_REQUESTS_S)
 
