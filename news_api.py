@@ -17,7 +17,7 @@ import mysql.connector
 # CONFIG
 # ============================================================
 
-THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "")
+THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
