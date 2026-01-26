@@ -17,7 +17,7 @@ THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1
 
 # Repo root (adjust if your layout differs; parents[0] = folder containing this file)
 ROOT = Path(__file__).resolve().parents[1]          # repo root
-CONFIG_PATH = ROOT / "json" / "news.json"
+CONFIG_PATH = ROOT / "news_llm" / "json" / "news.json"
 
 # MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
