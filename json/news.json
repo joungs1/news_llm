@@ -60,7 +60,29 @@
 
   "sources": {
     "mode": "domains",
-    "include": ["reuters.com"],
+    "include": [
+      "reuters.com",
+      "bloomberg.com",
+      "apnews.com",
+      "ft.com",
+  
+      "wsj.com",
+      "marketwatch.com",
+      "cnbc.com",
+      "economist.com",
+  
+      "theglobeandmail.com",
+      "bnnbloomberg.ca",
+      "financialpost.com",
+      "nytimes.com",
+      "washingtonpost.com",
+  
+      "argusmedia.com",
+      "spglobal.com",
+      "spglobalenergy.com",
+      "defensenews.com",
+      "oilprice.com"
+    ],
     "exclude": [
       "reddit.com",
       "twitter.com",
