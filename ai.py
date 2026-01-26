@@ -47,8 +47,8 @@ USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
 # --- Pull size limits ---
 NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
 BARS_LIMIT = int(os.getenv("BARS_LIMIT", "120"))
-BARS_INTERVAL = os.getenv("BARS_INTERVAL", "1d")
-BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")
+BARS_INTERVAL = os.getenv("BARS_INTERVAL", "1d")     # matches Finance.finance_ohlcv_cache.bar_interval
+BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")        # matches Finance.finance_ohlcv_cache.period
 
 # Pacing
 SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
@@ -242,70 +242,27 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# FINANCE BARS: SCHEMA-AWARE FILTERING
-#   Fixes:
-#   - reserved keyword interval
-#   - missing interval/period columns
+# FINANCE BARS (FULL SCHEMA: bar_interval + period)
+#   Your schema:
+#     ticker, bar_interval, period, ts_utc, open, high, low, close, volume,
+#     ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low, ...
 # ============================================================
 
-_BARS_FILTER_COLS: Optional[Dict[str, Optional[str]]] = None
-
-def detect_bars_filter_cols() -> Dict[str, Optional[str]]:
-    """
-    Detects whether finance_ohlcv_cache has interval/period-style columns.
-    If not found, we fallback to querying by ticker only.
-    """
-    cnx = mysql_connect(MYSQL_DB_FINANCE)
-    cur = cnx.cursor()
-    cur.execute(f"SHOW COLUMNS FROM `{MYSQL_TABLE_BARS}`")
-    cols = {row[0].lower() for row in cur.fetchall()}
-    cur.close()
-    cnx.close()
-
-    # Try a few common names
-    interval_candidates = ["interval", "bar_interval", "timeframe", "tf"]
-    period_candidates = ["period", "lookback_period", "window", "range_name"]
-
-    interval_col = next((c for c in interval_candidates if c in cols), None)
-    period_col = next((c for c in period_candidates if c in cols), None)
-
-    return {"interval_col": interval_col, "period_col": period_col}
-
 def fetch_finance_bars(ticker: str) -> List[Dict[str, Any]]:
-    global _BARS_FILTER_COLS
-    if _BARS_FILTER_COLS is None:
-        _BARS_FILTER_COLS = detect_bars_filter_cols()
-
-    interval_col = _BARS_FILTER_COLS.get("interval_col")
-    period_col = _BARS_FILTER_COLS.get("period_col")
-
     cnx = mysql_connect(MYSQL_DB_FINANCE)
     cur = cnx.cursor(dictionary=True)
 
-    base_select = f"""
+    cur.execute(f"""
       SELECT ts_utc, open, high, low, close, volume,
              ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low
       FROM `{MYSQL_TABLE_BARS}`
-    """
+      WHERE ticker=%s
+        AND bar_interval=%s
+        AND period=%s
+      ORDER BY ts_utc DESC
+      LIMIT %s
+    """, (ticker, BARS_INTERVAL, BARS_PERIOD, BARS_LIMIT))
 
-    if interval_col and period_col:
-        q = base_select + f"""
-          WHERE ticker=%s
-            AND `{interval_col}`=%s
-            AND `{period_col}`=%s
-          ORDER BY ts_utc DESC
-          LIMIT %s
-        """
-        params = (ticker, BARS_INTERVAL, BARS_PERIOD, BARS_LIMIT)
-    else:
-        q = base_select + """
-          WHERE ticker=%s
-          ORDER BY ts_utc DESC
-          LIMIT %s
-        """
-        params = (ticker, BARS_LIMIT)
-
-    cur.execute(q, params)
     rows = cur.fetchall()
     cur.close()
     cnx.close()
@@ -346,9 +303,6 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
 
 # ============================================================
 # JSON EXTRACTION (ROBUST)
-#   Also handles:
-#   - leading/trailing junk
-#   - multiple JSON objects: we take first complete object
 # ============================================================
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -401,10 +355,6 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
 # ============================================================
 # LLM (OpenAI-compatible via Ollama)
-#   Improvements:
-#   - temperature=0
-#   - attempt JSON mode (response_format) if supported
-#   - if parsing fails, we still store a neutral fallback rec
 # ============================================================
 
 def build_prompt(packet: Dict[str, Any]) -> str:
@@ -535,7 +485,6 @@ def run_once(
         try:
             bars = fetch_finance_bars(ticker)
 
-            # News may be empty; your news pipeline currently is macro-scoped.
             news = fetch_news_in_window(name, start_utc, end_utc)
             if not news and name != ticker:
                 news = fetch_news_in_window(ticker, start_utc, end_utc)
@@ -549,7 +498,7 @@ def run_once(
                 },
                 "finance": {
                     "bars_n": len(bars),
-                    "interval": BARS_INTERVAL,
+                    "bar_interval": BARS_INTERVAL,
                     "period": BARS_PERIOD,
                     "tail_30": bars[-30:] if len(bars) > 30 else bars,
                 },
@@ -570,10 +519,9 @@ def run_once(
                 "simplified": out,
                 "input_digest": {
                     "bars_n": len(bars),
-                    "bars_interval": BARS_INTERVAL,
-                    "bars_period": BARS_PERIOD,
+                    "bar_interval": BARS_INTERVAL,
+                    "period": BARS_PERIOD,
                     "news_count": len(news or []),
-                    "bars_filter_cols": _BARS_FILTER_COLS,
                     "models": {
                         "primary": DEFAULT_MODEL,
                         "fallback": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None,
@@ -581,7 +529,7 @@ def run_once(
                     },
                     "note": note,
                 },
-                "error": None if (note is None or "Neutral due" in (out.get("recommendation_sentence") or "")) else None,
+                "error": None,
             }
 
             upsert_ai_row(row)
@@ -601,7 +549,7 @@ def run_once(
                 "confidence_0_to_100": 10,
                 "recommendation_sentence": f"Neutral due to pipeline error: {err}",
                 "simplified": neutral_fallback(err),
-                "input_digest": {"bars_filter_cols": _BARS_FILTER_COLS},
+                "input_digest": {"bar_interval": BARS_INTERVAL, "period": BARS_PERIOD},
                 "error": err,
             }
             try:
