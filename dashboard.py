@@ -10,22 +10,26 @@ What it does
     /api/tickers
     /api/availability?ticker=...
     /api/finance?ticker=...&interval=...&period=...&date=YYYY-MM-DD
+    /api/analyst?ticker=...&date=YYYY-MM-DD
     /api/news?company=...&date=YYYY-MM-DD
     /api/ai?ticker=...&date=YYYY-MM-DD
 
-How to run (example)
+How to run (standalone)
   pip install flask mysql-connector-python
   export MYSQL_HOST=100.117.198.80
   export MYSQL_USER=admin
   export MYSQL_PASSWORD='...'
-  python dashboard_server.py --host 0.0.0.0 --port 8000
+  python dashboard.py --host 0.0.0.0 --port 8000
+
+How to run (from main.py)
+  import dashboard
+  dashboard.run_server(host="0.0.0.0", port=8000)
 
 Then open from another device via Tailscale:
   http://<TAILSCALE_IP_OF_SERVER>:8000/
 """
 
 import os
-import json
 import argparse
 from datetime import datetime, timezone, timedelta, date as date_cls
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,7 +43,7 @@ from flask import Flask, request, jsonify, Response
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")  # prefer env var in production
 
 # Finance DB
 MYSQL_DB_FINANCE = os.getenv("MYSQL_DB_FINANCE", "Finance")
@@ -67,7 +71,6 @@ USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
 # ============================================================
 app = Flask(__name__)
 
-
 # ============================================================
 # Helpers
 # ============================================================
@@ -94,33 +97,20 @@ def dt_utc_naive(dt: datetime) -> datetime:
 
 def parse_yyyy_mm_dd(s: Optional[str]) -> date_cls:
     if not s:
-        # default today (UTC)
         now = datetime.now(timezone.utc) if USE_UTC_DAY else datetime.now()
         return date_cls(now.year, now.month, now.day)
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
 def day_window(d: date_cls) -> Tuple[datetime, datetime]:
-    if USE_UTC_DAY:
-        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=1)
-        return start, end
-    # If you truly store local-naive day windows, adjust here; default keeps UTC for DB comparisons.
+    # We standardize day selection in UTC for all DB comparisons.
     start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     return start, end
 
 
-def to_iso_if_dt(v: Any) -> Any:
-    if isinstance(v, datetime):
-        return iso_z(v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v)
-    return v
-
-
 def safe_json(obj: Any) -> Any:
-    """
-    Make mysql connector types JSON-safe.
-    """
+    """Make mysql connector types JSON-safe."""
     if isinstance(obj, dict):
         return {k: safe_json(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -185,8 +175,7 @@ def fetch_finance_series(
     cnx = mysql_connect(MYSQL_DB_FINANCE)
     cur = cnx.cursor(dictionary=True)
 
-    # We filter by ts_utc < end_utc to show "as of this day"
-    # If you want only THAT day, add AND ts_utc >= start_utc.
+    # Show bars up to end of selected day (inclusive boundary via < end_utc)
     cur.execute(
         f"""
         SELECT ts_utc, open, high, low, close, volume,
@@ -204,16 +193,13 @@ def fetch_finance_series(
     cur.close()
     cnx.close()
 
-    rows = list(reversed(rows))  # chronological ascending
+    rows = list(reversed(rows))  # chronological
 
     data = []
     fetched_at = None
     for r in rows:
         ts = r.get("ts_utc")
-        if isinstance(ts, datetime):
-            t_iso = iso_z(ts.replace(tzinfo=timezone.utc))
-        else:
-            t_iso = str(ts)
+        t_iso = iso_z(ts.replace(tzinfo=timezone.utc)) if isinstance(ts, datetime) else str(ts)
 
         fetched_at_dt = r.get("fetched_at_utc")
         if fetched_at_dt and isinstance(fetched_at_dt, datetime):
@@ -254,7 +240,6 @@ def fetch_analyst_block(ticker: str, d: date_cls) -> Dict[str, Any]:
     start_utc, end_utc = day_window(d)
 
     # latest snapshot
-    snapshot = None
     cnx = mysql_connect(MYSQL_DB_FINANCE)
     cur = cnx.cursor(dictionary=True)
     cur.execute(
@@ -296,8 +281,6 @@ def fetch_analyst_block(ticker: str, d: date_cls) -> Dict[str, Any]:
 
 # ============================================================
 # News: same-day important items
-# NOTE: your news pipeline uses company=display_name/id, not guaranteed ticker.
-# Dashboard will call with "company" from watchlist label (or ticker as fallback).
 # ============================================================
 def fetch_news_block(company: str, d: date_cls) -> List[Dict[str, Any]]:
     start_utc, end_utc = day_window(d)
@@ -328,12 +311,11 @@ def fetch_news_block(company: str, d: date_cls) -> List[Dict[str, Any]]:
 # ============================================================
 def fetch_ai_block(ticker: str, d: date_cls) -> Optional[Dict[str, Any]]:
     start_utc, end_utc = day_window(d)
-    run_date = d
 
     cnx = mysql_connect(MYSQL_DB_AI)
     cur = cnx.cursor(dictionary=True)
 
-    # prefer exact run_date match if you store it; otherwise fall back to as_of_utc within the day
+    # Prefer exact run_date if you store it
     cur.execute(
         f"""
         SELECT run_date, as_of_utc, ticker, company_name, model,
@@ -345,11 +327,12 @@ def fetch_ai_block(ticker: str, d: date_cls) -> Optional[Dict[str, Any]]:
         ORDER BY as_of_utc DESC
         LIMIT 1
         """,
-        (ticker, str(run_date)),
+        (ticker, str(d)),
     )
     row = cur.fetchone()
 
     if not row:
+        # Fall back to within the day window
         cur.execute(
             f"""
             SELECT run_date, as_of_utc, ticker, company_name, model,
@@ -530,7 +513,6 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   function todayUTC_yyyy_mm_dd() {
     const now = new Date();
-    // UTC date components
     const y = now.getUTCFullYear();
     const m = String(now.getUTCMonth()+1).padStart(2, "0");
     const d = String(now.getUTCDate()).padStart(2, "0");
@@ -560,8 +542,6 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
 
   function computePresets() {
-    // Trace order:
-    // 0 candles, 1 EMA, 2 VWAP, 3 BB_UP, 4 BB_MID, 5 BB_LOW, 6 Volume, 7 RSI, 8 MACD
     return {
       core:       [true, true, true, false, false, false, true, true, true],
       all:        [true, true, true, true,  true,  true,  true, true, true],
@@ -655,7 +635,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     let html = "";
     if (snap) {
       html += `<div><b>Latest snapshot</b></div>`;
-      // show a few common fields if present
       const fields = ["as_of_utc", "recommendation", "rating", "target_mean", "target_high", "target_low",
                       "number_of_analysts", "buy", "hold", "sell"];
       html += `<div class="small">` + fields
@@ -739,16 +718,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       const fig = buildFigure(finance);
       await Plotly.newPlot("chart", fig.traces, fig.layout, {responsive:true});
 
-      // AI uses ticker
       const ai = await apiGet(`/api/ai?ticker=${encodeURIComponent(ticker)}&date=${encodeURIComponent(d)}`);
       renderAI(ai.row);
 
-      // Analyst uses ticker
       const analyst = await apiGet(`/api/analyst?ticker=${encodeURIComponent(ticker)}&date=${encodeURIComponent(d)}`);
       renderAnalyst(analyst);
 
-      // News uses "company". If your news DB uses company display_name rather than ticker,
-      // you can set your news pipeline company names to match tickers, or adjust here later.
+      // NOTE: currently uses ticker as company key. If your news DB uses display names, adjust here.
       const news = await apiGet(`/api/news?company=${encodeURIComponent(ticker)}&date=${encodeURIComponent(d)}`);
       renderNews(news.items);
 
@@ -803,15 +779,12 @@ def dashboard():
 
 
 # ============================================================
-# Entrypoint
+# Exported server runner for main.py
 # ============================================================
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0", help="Bind address (use 0.0.0.0 for Tailscale access)")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--debug", action="store_true")
-    args = ap.parse_args()
-
+def run_server(host: str = "0.0.0.0", port: int = 8000, debug: bool = False):
+    """
+    main.py expects dashboard.run_server(...)
+    """
     # Minimal connectivity check (fails fast)
     try:
         cnx = mysql_connect()
@@ -819,8 +792,20 @@ def main():
     except Exception as e:
         raise SystemExit(f"MySQL connection failed: {type(e).__name__}: {e}")
 
-    print(f"Serving dashboard on http://{args.host}:{args.port}/")
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    print(f"Serving dashboard on http://{host}:{port}/")
+    app.run(host=host, port=port, debug=debug, threaded=True)
+
+
+# ============================================================
+# CLI Entrypoint
+# ============================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0", help="Bind address (use 0.0.0.0 for Tailscale access)")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+    run_server(host=args.host, port=args.port, debug=args.debug)
 
 
 if __name__ == "__main__":
