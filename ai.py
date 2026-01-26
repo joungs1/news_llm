@@ -58,7 +58,12 @@ RETRY_ON_BAD_JSON = os.getenv("RETRY_ON_BAD_JSON", "1").strip() == "1"
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek-r1:latest")
 
 # If your Ollama OpenAI-compatible server supports response_format JSON mode.
+# If not supported, code auto-falls back.
 FORCE_JSON_MODE = os.getenv("FORCE_JSON_MODE", "1").strip() == "1"
+
+# Optional: try a "repair" pass if model returns truncated JSON
+ENABLE_JSON_REPAIR = os.getenv("ENABLE_JSON_REPAIR", "1").strip() == "1"
+
 
 # ============================================================
 # TIME HELPERS
@@ -91,6 +96,7 @@ def day_window_for_date(d: Optional[date_cls] = None) -> Tuple[datetime, datetim
     end_local = start_local + timedelta(days=1)
     return start_local.replace(tzinfo=timezone.utc), end_local.replace(tzinfo=timezone.utc)
 
+
 # ============================================================
 # WATCHLIST JSON
 # ============================================================
@@ -122,7 +128,7 @@ def load_watchlist(path: Path) -> List[Dict[str, str]]:
         t = normalize_ticker(row.get("Ticker"))
         if not t or t in seen:
             continue
-        # Guard: skip CLI flags accidentally ending up as tickers
+        # guard against flags accidentally being treated as tickers
         if t.startswith("-"):
             continue
         seen.add(t)
@@ -131,6 +137,7 @@ def load_watchlist(path: Path) -> List[Dict[str, str]]:
             "name": str(row.get("Potential") or row.get("display_name") or t).strip()
         })
     return out
+
 
 # ============================================================
 # MYSQL
@@ -239,6 +246,7 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
     cur.close()
     cnx.close()
 
+
 # ============================================================
 # FINANCE BARS (FULL SCHEMA: bar_interval + period)
 # ============================================================
@@ -268,6 +276,7 @@ def fetch_finance_bars(ticker: str) -> List[Dict[str, Any]]:
             r["ts_utc"] = r["ts_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     return rows
 
+
 # ============================================================
 # NEWS (optional; safe if empty)
 # ============================================================
@@ -293,6 +302,7 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
         if isinstance(r.get("timestamp_utc"), datetime):
             r["timestamp_utc"] = r["timestamp_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     return rows
+
 
 # ============================================================
 # JSON EXTRACTION (ROBUST)
@@ -345,9 +355,9 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
     raise ValueError("Found '{' but could not extract a complete JSON object")
 
+
 # ============================================================
-# LLM
-#   FIX: validate required keys so we never save None/None/None
+# LLM (schema enforcement + JSON mode + repair)
 # ============================================================
 
 def build_prompt(packet: Dict[str, Any]) -> str:
@@ -379,43 +389,96 @@ def neutral_fallback(reason: str) -> Dict[str, Any]:
     }
 
 def validate_llm_output(out: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Enforce required keys so dashboard never gets None fields.
-    """
     if not isinstance(out, dict):
         raise ValueError("LLM output is not a JSON object")
 
-    required = ("stance", "confidence_0_to_100", "recommendation_sentence",
-                "key_drivers", "risks", "what_to_watch_next")
+    required = (
+        "stance",
+        "confidence_0_to_100",
+        "recommendation_sentence",
+        "key_drivers",
+        "risks",
+        "what_to_watch_next",
+    )
     missing = [k for k in required if k not in out]
 
-    # Also reject null/empty core fields
-    if not out.get("stance") or out.get("recommendation_sentence") in (None, "", "null"):
-        if "stance" not in missing:
-            missing.append("stance")
-        if "recommendation_sentence" not in missing:
-            missing.append("recommendation_sentence")
+    stance = out.get("stance")
+    if stance not in ("bullish", "neutral", "bearish"):
+        missing.append("stance")
+
+    rec = out.get("recommendation_sentence")
+    if rec in (None, "", "null"):
+        missing.append("recommendation_sentence")
+
+    conf = out.get("confidence_0_to_100")
+    if conf is None:
+        missing.append("confidence_0_to_100")
+    else:
+        try:
+            c = int(conf)
+            out["confidence_0_to_100"] = max(0, min(100, c))
+        except Exception:
+            missing.append("confidence_0_to_100")
 
     if missing:
-        raise ValueError(f"LLM output missing required fields: {missing}")
+        raise ValueError(f"LLM output missing/invalid fields: {sorted(set(missing))}")
 
     return out
 
+def repair_to_json(client: OpenAI, model: str, bad_text: str) -> Dict[str, Any]:
+    prompt = (
+        "You will be given malformed or incomplete JSON-like text.\n"
+        "Return ONLY a valid JSON object matching this schema:\n"
+        '{"stance":"bullish|neutral|bearish","confidence_0_to_100":0,'
+        '"recommendation_sentence":"string","key_drivers":["a","b","c"],'
+        '"risks":["a","b","c"],"what_to_watch_next":["a","b","c"]}\n\n'
+        f"TEXT:\n{bad_text}\n"
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=450,
+        stream=False,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    out = extract_json_object(text)
+    return validate_llm_output(out)
+
 def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = dict(
+    base_kwargs: Dict[str, Any] = dict(
         model=model,
         messages=[{"role": "user", "content": build_prompt(packet)}],
         temperature=0.0,
         max_tokens=650,
         stream=False,
     )
-    if FORCE_JSON_MODE:
-        kwargs["response_format"] = {"type": "json_object"}
 
-    resp = client.chat.completions.create(**kwargs)
+    # 1) Try JSON mode (if enabled). If not supported, fall back.
+    if FORCE_JSON_MODE:
+        try:
+            resp = client.chat.completions.create(
+                **base_kwargs,
+                response_format={"type": "json_object"},
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            out = extract_json_object(text)
+            return validate_llm_output(out)
+        except Exception:
+            pass
+
+    # 2) Plain mode
+    resp = client.chat.completions.create(**base_kwargs)
     text = (resp.choices[0].message.content or "").strip()
-    out = extract_json_object(text)
-    return validate_llm_output(out)
+
+    try:
+        out = extract_json_object(text)
+        return validate_llm_output(out)
+    except Exception:
+        if not ENABLE_JSON_REPAIR:
+            raise
+        # One repair attempt
+        return repair_to_json(client, model, text)
 
 def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Optional[str]]:
     """
@@ -426,7 +489,6 @@ def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str,
         return out, model, None
     except Exception as e1:
         if not RETRY_ON_BAD_JSON or not FALLBACK_MODEL:
-            # return neutral fallback instead of crashing
             reason = f"primary_failed_no_fallback: {type(e1).__name__}: {e1}"
             return neutral_fallback(reason), model, reason
 
@@ -436,6 +498,7 @@ def run_llm_with_optional_fallback(client: OpenAI, model: str, packet: Dict[str,
         except Exception as e2:
             reason = f"primary={type(e1).__name__}: {e1}; fallback={type(e2).__name__}: {e2}"
             return neutral_fallback(reason), model, reason
+
 
 # ============================================================
 # ORCHESTRATION API (what main.py expects)
@@ -480,9 +543,8 @@ def run_once(
     if not watch:
         raise RuntimeError(f"No tickers found in: {_STATE['watchlist_path']}")
 
-    # optional filter
     if tickers is not None:
-        wanted = {normalize_ticker(t) for t in tickers if str(t).strip() and not str(t).strip().startswith("-")}
+        wanted = {normalize_ticker(t) for t in tickers if t and not str(t).strip().startswith("-")}
         watch = [w for w in watch if w["ticker"] in wanted]
 
     if max_tickers is not None:
@@ -496,7 +558,6 @@ def run_once(
         ticker = item["ticker"]
         name = item["name"]
 
-        # Guard against accidental flags
         if ticker.startswith("-"):
             errors.append(f"{ticker}: skipped (looks like CLI flag)")
             saved_err += 1
@@ -546,6 +607,7 @@ def run_once(
                         "primary": DEFAULT_MODEL,
                         "fallback": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None,
                         "json_mode_requested": FORCE_JSON_MODE,
+                        "json_repair_enabled": ENABLE_JSON_REPAIR,
                     },
                     "note": note,
                 },
@@ -595,6 +657,7 @@ def run_once(
         "errors": errors[:50],
         "ts_utc": utc_now().isoformat(),
     }
+
 
 # ============================================================
 # Standalone entrypoint
