@@ -6,6 +6,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 import mysql.connector
+from pathlib import Path
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 ROOT = Path(__file__).resolve().parents[1]          # repo root
