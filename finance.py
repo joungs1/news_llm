@@ -18,7 +18,7 @@ import mysql.connector
 # Adjust parents[1] if your script is not in repo/src/
 # ============================================================
 ROOT = Path(__file__).resolve().parents[1]          # repo root
-WATCHLIST_JSON = ROOT / "json" / "tickers.json"     # JSON array of objects with "Ticker"
+WATCHLIST_JSON = ROOT / "news_llm" / "json" / "tickers.json"     # JSON array of objects with "Ticker"
 
 # Sleep between remote calls (yfinance)
 SLEEP_BETWEEN_REQUESTS_S = float(os.getenv("SLEEP_BETWEEN_REQUESTS_S", "0.25"))
