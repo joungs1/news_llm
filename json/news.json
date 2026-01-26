@@ -3,13 +3,12 @@
     "interval_seconds": 120,
     "lookback_minutes": 1440,
     "language": "en",
-    "page_size": 50,
+    "limit": 50,
     "iterations": null
   },
 
   "query": {
     "mode": "everything",
-
     "companies": [
       {
         "id": "macro",
@@ -46,55 +45,54 @@
       { "name": "Nutrien", "ticker": "NTR" },
       { "name": "Shopify", "ticker": "SHOP" },
 
-      { "name": "iShares U.S. Aggregate Bond ETF", "ticker": "XAGG", "type": "bond_etf" },
-      { "name": "Vanguard Canadian Aggregate Bond ETF", "ticker": "VAB", "type": "bond_etf" },
-      { "name": "iShares Emerging Markets Bond ETF", "ticker": "XEB", "type": "bond_etf" },
+      { "name": "iShares U.S. Aggregate Bond ETF", "ticker": "XAGG" },
+      { "name": "Vanguard Canadian Aggregate Bond ETF", "ticker": "VAB" },
+      { "name": "iShares Emerging Markets Bond ETF", "ticker": "XEB" },
 
-      { "name": "Global X Uranium ETF", "ticker": "HURA", "type": "thematic_etf" },
-      { "name": "iShares S&P/TSX Energy ETF", "ticker": "XEG", "type": "sector_etf" },
-      { "name": "iShares Global Gold ETF", "ticker": "XGD", "type": "sector_etf" },
-      { "name": "iShares Cybersecurity ETF", "ticker": "XHAK", "type": "thematic_etf" },
-      { "name": "Evolve Cyber Security ETF", "ticker": "CYBR", "type": "thematic_etf" }
+      { "name": "Global X Uranium ETF", "ticker": "HURA" },
+      { "name": "iShares S&P/TSX Energy ETF", "ticker": "XEG" },
+      { "name": "iShares Global Gold ETF", "ticker": "XGD" },
+      { "name": "iShares Cybersecurity ETF", "ticker": "XHAK" },
+      { "name": "Evolve Cyber Security ETF", "ticker": "CYBR" }
     ]
   },
 
-  "sources": {
-    "mode": "domains",
-    "include": [
-      "reuters.com",
-      "bloomberg.com",
-      "apnews.com",
-      "ft.com",
-  
-      "wsj.com",
-      "marketwatch.com",
-      "cnbc.com",
-      "economist.com",
-  
-      "theglobeandmail.com",
-      "bnnbloomberg.ca",
-      "financialpost.com",
-      "nytimes.com",
-      "washingtonpost.com",
-  
-      "argusmedia.com",
-      "spglobal.com",
-      "spglobalenergy.com",
-      "defensenews.com",
-      "oilprice.com"
-    ],
-    "exclude": [
-      "reddit.com",
-      "twitter.com",
-      "x.com",
-      "facebook.com",
-      "medium.com",
-      "substack.com",
-      "blogspot.com",
-      "wordpress.com",
-      "youtube.com",
-      "tiktok.com"
-    ]
+  "thenewsapi": {
+    "endpoint": "all",
+    "domains": {
+      "include": [
+        "reuters.com",
+        "bloomberg.com",
+        "apnews.com",
+        "ft.com",
+        "wsj.com",
+        "marketwatch.com",
+        "cnbc.com",
+        "economist.com",
+        "theglobeandmail.com",
+        "bnnbloomberg.ca",
+        "financialpost.com",
+        "nytimes.com",
+        "washingtonpost.com",
+        "argusmedia.com",
+        "spglobal.com",
+        "spglobalenergy.com",
+        "defensenews.com",
+        "oilprice.com"
+      ],
+      "exclude": [
+        "reddit.com",
+        "twitter.com",
+        "x.com",
+        "facebook.com",
+        "medium.com",
+        "substack.com",
+        "blogspot.com",
+        "wordpress.com",
+        "youtube.com",
+        "tiktok.com"
+      ]
+    }
   },
 
   "model": {
