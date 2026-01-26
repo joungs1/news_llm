@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import argparse
+import requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import mysql.connector
+from openai import OpenAI
+
+# ============================================================
+# CONFIG (env overrides supported)
+# ============================================================
+
+# --- Repo paths ---
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "json" / "tickers.json")))
+
+# --- Ollama (remote) ---
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.88.217.85:11434")
+OPENAI_BASE = f"{OLLAMA_HOST}/v1"
+
+# Preferred default model for this workflow:
+# - Strong at JSON + synthesis: qwen2.5:14b
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+
+# --- MySQL connection ---
+MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "admin")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
+
+# --- Source DBs/Tables ---
+# News DB/table (from your news pipeline)
+MYSQL_DB_NEWS = os.getenv("MYSQL_DB_NEWS", "LLM")
+MYSQL_TABLE_NEWS = os.getenv("MYSQL_TABLE_NEWS", "news_llm_analysis")
+
+# Finance DB/tables (from your finance pipeline)
+MYSQL_DB_FINANCE = os.getenv("MYSQL_DB_FINANCE", "Finance")
+MYSQL_TABLE_BARS = os.getenv("MYSQL_TABLE_FINANCE", "finance_ohlcv_cache")
+
+# Analyst tables (you said you have analyst dataset too)
+MYSQL_TABLE_ANALYST_SNAPSHOT = os.getenv("MYSQL_TABLE_ANALYST_SNAPSHOT", "analyst_snapshot")
+MYSQL_TABLE_ANALYST_EVENTS = os.getenv("MYSQL_TABLE_ANALYST_EVENTS", "analyst_events")
+
+# --- Output DB/table ---
+MYSQL_DB_AI = os.getenv("MYSQL_DB_AI", "AI")
+MYSQL_TABLE_AI = os.getenv("MYSQL_TABLE_AI", "ai_recommendations")
+
+# --- “Same day” window ---
+# Default is UTC day window; your MySQL timestamps should be stored as UTC-naive (as per your earlier code).
+USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
+
+# --- Pull size limits ---
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
+ANALYST_EVENTS_LIMIT = int(os.getenv("ANALYST_EVENTS_LIMIT", "20"))
+
+# Finance bars used to form signals (kept small for LLM packet)
+BARS_LIMIT = int(os.getenv("BARS_LIMIT", "120"))
+BARS_INTERVAL = os.getenv("BARS_INTERVAL", "1d")
+BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")
+
+# Pacing
+SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
+
+# If JSON fails, optionally retry once with a fallback model (recommended)
+RETRY_ON_BAD_JSON = os.getenv("RETRY_ON_BAD_JSON", "1").strip() == "1"
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek-r1:latest")
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def dt_utc_naive(dt: datetime) -> datetime:
+    # MySQL DATETIME commonly stored naive; treat it as UTC naive.
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+def day_window() -> Tuple[datetime, datetime]:
+    if USE_UTC_DAY:
+        now = utc_now()
+        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        return start, end
+
+    # Local day window (only use if your stored timestamps follow same interpretation)
+    now_local = datetime.now()
+    start_local = datetime(now_local.year, now_local.month, now_local.day)
+    end_local = start_local + timedelta(days=1)
+    # interpret as UTC for MySQL naive comparisons (approx)
+    return start_local.replace(tzinfo=timezone.utc), end_local.replace(tzinfo=timezone.utc)
+
+
+# ============================================================
+# WATCHLIST JSON
+# Expect: JSON array of objects containing "Ticker" and optionally "Potential"
+# Example: [{"Potential":"RBC","Ticker":"RY.TO"}, ...]
+# ============================================================
+def normalize_ticker(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    s = s.replace(" ", "").replace("/", "-")
+    if s.upper().endswith("-TO"):
+        s = s[:-3] + ".TO"
+    return s
+
+def load_watchlist(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Watchlist JSON not found: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("Watchlist JSON must be a JSON array (list) of objects.")
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        t = normalize_ticker(row.get("Ticker"))
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append({
+            "ticker": t,
+            "name": str(row.get("Potential") or row.get("display_name") or t).strip()
+        })
+    return out
+
+
+# ============================================================
+# MYSQL
+# ============================================================
+def mysql_connect(db: str | None = None):
+    cfg = dict(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        autocommit=True,
+    )
+    if db:
+        cfg["database"] = db
+    return mysql.connector.connect(**cfg)
+
+def ensure_ai_db_and_table() -> None:
+    cnx = mysql_connect()
+    cur = cnx.cursor()
+    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB_AI}` DEFAULT CHARACTER SET utf8mb4")
+    cur.close()
+    cnx.close()
+
+    cnx = mysql_connect(MYSQL_DB_AI)
+    cur = cnx.cursor()
+    cur.execute(f"""
+    CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE_AI}` (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+
+      run_date DATE NOT NULL,
+      as_of_utc DATETIME NOT NULL,
+
+      ticker VARCHAR(32) NOT NULL,
+      company_name VARCHAR(255) NULL,
+
+      model VARCHAR(255) NOT NULL,
+
+      stance VARCHAR(16) NULL,               -- bullish|neutral|bearish
+      confidence_0_to_100 INT NULL,
+
+      recommendation_sentence TEXT NULL,     -- 1 sentence
+      simplified JSON NULL,                  -- full structured output
+      input_digest JSON NULL,                -- compact “what we fed” + perf
+
+      error TEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_run (run_date, ticker, model),
+      KEY idx_ticker (ticker),
+      KEY idx_asof (as_of_utc)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
+    cur.close()
+    cnx.close()
+
+def upsert_ai_row(row: Dict[str, Any]) -> None:
+    cnx = mysql_connect(MYSQL_DB_AI)
+    cur = cnx.cursor()
+
+    sql = f"""
+    INSERT INTO `{MYSQL_TABLE_AI}` (
+      run_date, as_of_utc,
+      ticker, company_name,
+      model,
+      stance, confidence_0_to_100,
+      recommendation_sentence,
+      simplified, input_digest,
+      error
+    ) VALUES (
+      %s, %s,
+      %s, %s,
+      %s,
+      %s, %s,
+      %s,
+      %s, %s,
+      %s
+    )
+    ON DUPLICATE KEY UPDATE
+      as_of_utc=VALUES(as_of_utc),
+      company_name=VALUES(company_name),
+      stance=VALUES(stance),
+      confidence_0_to_100=VALUES(confidence_0_to_100),
+      recommendation_sentence=VALUES(recommendation_sentence),
+      simplified=VALUES(simplified),
+      input_digest=VALUES(input_digest),
+      error=VALUES(error);
+    """
+
+    vals = (
+        row["run_date"],
+        row["as_of_utc"],
+        row["ticker"],
+        row.get("company_name"),
+        row["model"],
+        row.get("stance"),
+        row.get("confidence_0_to_100"),
+        row.get("recommendation_sentence"),
+        json.dumps(row.get("simplified"), ensure_ascii=False) if row.get("simplified") is not None else None,
+        json.dumps(row.get("input_digest"), ensure_ascii=False) if row.get("input_digest") is not None else None,
+        row.get("error"),
+    )
+
+    cur.execute(sql, vals)
+    cur.close()
+    cnx.close()
+
+
+# ============================================================
+# DATA FETCH: finance + analyst + news (same day window)
+# ============================================================
+def fetch_finance_bars(ticker: str) -> List[Dict[str, Any]]:
+    cnx = mysql_connect(MYSQL_DB_FINANCE)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute(f"""
+      SELECT ts_utc, open, high, low, close, volume,
+             ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low
+      FROM `{MYSQL_TABLE_BARS}`
+      WHERE ticker=%s AND interval=%s AND period=%s
+      ORDER BY ts_utc DESC
+      LIMIT %s
+    """, (ticker, BARS_INTERVAL, BARS_PERIOD, BARS_LIMIT))
+    rows = cur.fetchall()
+    cur.close()
+    cnx.close()
+
+    # ascending time
+    rows = list(reversed(rows))
+    for r in rows:
+        if isinstance(r.get("ts_utc"), datetime):
+            r["ts_utc"] = r["ts_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return rows
+
+def fetch_latest_analyst_snapshot(ticker: str) -> Optional[Dict[str, Any]]:
+    cnx = mysql_connect(MYSQL_DB_FINANCE)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute(f"""
+      SELECT *
+      FROM `{MYSQL_TABLE_ANALYST_SNAPSHOT}`
+      WHERE ticker=%s
+      ORDER BY as_of_utc DESC
+      LIMIT 1
+    """, (ticker,))
+    row = cur.fetchone()
+    cur.close()
+    cnx.close()
+
+    if not row:
+        return None
+
+    if isinstance(row.get("as_of_utc"), datetime):
+        row["as_of_utc"] = row["as_of_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return row
+
+def fetch_analyst_events_in_window(ticker: str, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    cnx = mysql_connect(MYSQL_DB_FINANCE)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute(f"""
+      SELECT captured_at_utc, event_time_utc, firm, action, from_grade, to_grade, note
+      FROM `{MYSQL_TABLE_ANALYST_EVENTS}`
+      WHERE ticker=%s
+        AND captured_at_utc >= %s AND captured_at_utc < %s
+      ORDER BY captured_at_utc DESC
+      LIMIT %s
+    """, (ticker, dt_utc_naive(start_utc), dt_utc_naive(end_utc), ANALYST_EVENTS_LIMIT))
+    rows = cur.fetchall()
+    cur.close()
+    cnx.close()
+
+    for r in rows:
+        for k in ("captured_at_utc", "event_time_utc"):
+            if isinstance(r.get(k), datetime):
+                r[k] = r[k].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return rows
+
+def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    """
+    Your news pipeline stored `company` as display_name/id from config (not always ticker).
+    We will try company name first then fallback to ticker in the packet builder.
+    """
+    cnx = mysql_connect(MYSQL_DB_NEWS)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute(f"""
+      SELECT timestamp_utc, published_at, source, title, url,
+             one_sentence_summary, sentiment, confidence_0_to_100
+      FROM `{MYSQL_TABLE_NEWS}`
+      WHERE company=%s
+        AND timestamp_utc >= %s AND timestamp_utc < %s
+        AND (error IS NULL OR error = '')
+      ORDER BY timestamp_utc DESC
+      LIMIT %s
+    """, (company_key, dt_utc_naive(start_utc), dt_utc_naive(end_utc), NEWS_LIMIT))
+    rows = cur.fetchall()
+    cur.close()
+    cnx.close()
+
+    for r in rows:
+        if isinstance(r.get("timestamp_utc"), datetime):
+            r["timestamp_utc"] = r["timestamp_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return rows
+
+
+# ============================================================
+# PACKET BUILDER (keep small)
+# ============================================================
+def summarize_bars_for_packet(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not bars:
+        return {"bars_n": 0, "interval": BARS_INTERVAL, "period": BARS_PERIOD}
+
+    latest = bars[-1]
+    tail = bars[-30:]
+
+    def last_non_null(vals: List[Any]) -> Any:
+        for v in reversed(vals):
+            if v is not None:
+                return v
+        return None
+
+    last_close = latest.get("close")
+    last_ema20 = latest.get("ema20")
+    price_vs_ema_pct = None
+    if last_close is not None and last_ema20 not in (None, 0):
+        try:
+            price_vs_ema_pct = (float(last_close) / float(last_ema20) - 1.0) * 100.0
+        except Exception:
+            price_vs_ema_pct = None
+
+    rsi_vals = [r.get("rsi14") for r in tail]
+    macd_vals = [r.get("macd_hist") for r in tail]
+
+    return {
+        "bars_n": len(bars),
+        "interval": BARS_INTERVAL,
+        "period": BARS_PERIOD,
+        "latest": latest,
+        "tail_30": [
+            {
+                "t": r.get("ts_utc"),
+                "close": r.get("close"),
+                "rsi14": r.get("rsi14"),
+                "macd_hist": r.get("macd_hist"),
+                "ema20": r.get("ema20"),
+            }
+            for r in tail
+        ],
+        "derived": {
+            "last_close": last_close,
+            "last_rsi14": last_non_null(rsi_vals),
+            "last_macd_hist": last_non_null(macd_vals),
+            "price_vs_ema20_pct": price_vs_ema_pct,
+        }
+    }
+
+def build_packet(ticker: str, company_name: str, start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
+    bars = fetch_finance_bars(ticker)
+    snapshot = fetch_latest_analyst_snapshot(ticker)
+    events = fetch_analyst_events_in_window(ticker, start_utc, end_utc)
+
+    news = fetch_news_in_window(company_name, start_utc, end_utc)
+    if not news and company_name != ticker:
+        news = fetch_news_in_window(ticker, start_utc, end_utc)
+
+    return {
+        "ticker": ticker,
+        "company_name": company_name,
+        "day_window_utc": {
+            "start": start_utc.isoformat().replace("+00:00", "Z"),
+            "end": end_utc.isoformat().replace("+00:00", "Z"),
+        },
+        "finance": summarize_bars_for_packet(bars),
+        "analyst": {
+            "snapshot_latest": snapshot,
+            "events_in_window": events,
+        },
+        "news_in_window": news,
+    }
+
+
+# ============================================================
+# OLLAMA MODEL SELECTION (auto + optional interactive fallback)
+# ============================================================
+def list_ollama_models(ollama_host: str) -> List[str]:
+    r = requests.get(f"{ollama_host}/api/tags", timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return [m.get("name") for m in data.get("models", []) if m.get("name")]
+
+def pick_model(models: List[str], preferred: str, interactive: bool) -> str:
+    # If preferred exists, use it (no prompt)
+    if preferred and preferred in models:
+        return preferred
+
+    # If not interactive, fall back to first model
+    if not interactive:
+        return models[0] if models else preferred
+
+    # Interactive selection
+    if not models:
+        raise RuntimeError("No models found on the Ollama host.")
+
+    print("\nAvailable models on remote Ollama:\n")
+    for i, name in enumerate(models, start=1):
+        print(f"{i:>2}. {name}")
+
+    while True:
+        choice = input(f"\nSelect model by number (or type exact name). Preferred={preferred}: ").strip()
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(models):
+                return models[idx - 1]
+            print("Invalid number. Try again.")
+        else:
+            if choice in models:
+                return choice
+            print("Model name not found. Try again.")
+
+
+# ============================================================
+# LLM (OpenAI-compatible via Ollama)
+# ============================================================
+def extract_json_object(text: str) -> Dict[str, Any]:
+    if not text:
+        raise ValueError("Empty model response")
+
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not m:
+            raise ValueError("Could not locate JSON in model output")
+        return json.loads(m.group(0))
+
+def build_prompt(packet: Dict[str, Any]) -> str:
+    schema = {
+        "stance": "bullish|neutral|bearish",
+        "confidence_0_to_100": 0,
+        "recommendation_sentence": "ONE sentence recommendation.",
+        "key_drivers": ["string", "string", "string"],
+        "risks": ["string", "string", "string"],
+        "what_to_watch_next": ["string", "string", "string"]
+    }
+    return (
+        "Return ONLY valid JSON. No markdown.\n\n"
+        "You are an investment monitoring assistant. Use ONLY the provided input.\n"
+        "Do not invent facts. If evidence is insufficient, be neutral and say what is missing.\n\n"
+        f"Required JSON schema:\n{json.dumps(schema, indent=2)}\n\n"
+        "Input packet:\n"
+        f"{json.dumps(packet, ensure_ascii=False)}"
+    )
+
+def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    prompt = build_prompt(packet)
+    start = time.time()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=650,
+        stream=False,
+    )
+
+    elapsed = time.time() - start
+    text = resp.choices[0].message.content or ""
+    parsed = extract_json_object(text)
+
+    usage = getattr(resp, "usage", None)
+    perf = {
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+        "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+        "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+    }
+    return parsed, perf
+
+def run_llm_with_optional_fallback(
+    client: OpenAI,
+    model: str,
+    packet: Dict[str, Any],
+    allow_retry: bool,
+    fallback_model: str
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """
+    Returns: (analysis_json, perf_json, used_model)
+    """
+    try:
+        analysis, perf = run_llm_once(client, model, packet)
+        return analysis, perf, model
+    except Exception as e:
+        if not allow_retry or not fallback_model:
+            raise
+        # Retry once with fallback model
+        analysis, perf = run_llm_once(client, fallback_model, packet)
+        perf["note"] = f"primary_failed: {type(e).__name__}: {str(e)}"
+        return analysis, perf, fallback_model
+
+
+# ============================================================
+# OPTIONAL: quick model bakeoff on ONE ticker
+# ============================================================
+def score_schema(obj: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """
+    Simple completeness scoring (not perfect; good enough).
+    """
+    required = ["stance", "confidence_0_to_100", "recommendation_sentence", "key_drivers", "risks", "what_to_watch_next"]
+    missing = [k for k in required if k not in obj]
+    score = 100 - 15 * len(missing)
+    return max(score, 0), missing
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interactive-model", action="store_true", help="Prompt to pick model if preferred is missing.")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Preferred model name (default from OLLAMA_MODEL or qwen2.5:14b).")
+    ap.add_argument("--ticker", default=None, help="Run only this ticker (e.g. RY.TO).")
+    ap.add_argument("--bakeoff", action="store_true", help="Run one-ticker bakeoff across all models and print a small report (no DB writes).")
+    args = ap.parse_args()
+
+    ensure_ai_db_and_table()
+
+    # Connect to Ollama & discover models
+    try:
+        models = list_ollama_models(OLLAMA_HOST)
+    except Exception as e:
+        raise SystemExit(f"Could not reach Ollama at {OLLAMA_HOST}. Error: {e}")
+
+    if not models:
+        raise SystemExit(f"No models found on Ollama host: {OLLAMA_HOST}")
+
+    chosen_model = pick_model(models, args.model, interactive=args.interactive_model)
+    print(f"Using model: {chosen_model}")
+
+    client = OpenAI(base_url=OPENAI_BASE, api_key="ollama")
+
+    start_utc, end_utc = day_window()
+    run_date = start_utc.date()
+    as_of = dt_utc_naive(utc_now())
+
+    watch = load_watchlist(WATCHLIST_JSON)
+    if not watch:
+        raise SystemExit(f"No tickers found in: {WATCHLIST_JSON}")
+
+    if args.ticker:
+        t_norm = normalize_ticker(args.ticker)
+        watch = [w for w in watch if w["ticker"] == t_norm]
+        if not watch:
+            raise SystemExit(f"Ticker not found in watchlist: {t_norm}")
+
+    # Bakeoff: use first ticker in selected watchlist
+    if args.bakeoff:
+        item = watch[0]
+        packet = build_packet(item["ticker"], item["name"], start_utc, end_utc)
+
+        print(f"\nBAKEOFF on ticker={item['ticker']} ({item['name']}) window={start_utc.isoformat()} -> {end_utc.isoformat()}\n")
+        rows = []
+        for m in models:
+            try:
+                out, perf = run_llm_once(client, m, packet)
+                score, missing = score_schema(out)
+                rows.append((m, "OK", score, perf.get("elapsed_s"), missing, out.get("stance"), out.get("confidence_0_to_100")))
+            except Exception as e:
+                rows.append((m, "ERR", 0, None, [str(e)[:120]], None, None))
+
+        rows.sort(key=lambda x: (x[1] != "OK", -(x[2] or 0), (x[3] or 9999)))
+
+        print("Model".ljust(22), "Status".ljust(6), "Score".ljust(6), "Sec".ljust(6), "Stance".ljust(8), "Conf".ljust(6), "Notes")
+        print("-" * 100)
+        for m, status, score, sec, missing, stance, conf in rows:
+            note = ""
+            if status == "OK" and missing:
+                note = f"missing={missing}"
+            elif status != "OK":
+                note = f"{missing}"
+            print(
+                str(m).ljust(22),
+                str(status).ljust(6),
+                str(score).ljust(6),
+                (f"{sec:.2f}" if sec is not None else "-").ljust(6),
+                (str(stance) if stance is not None else "-").ljust(8),
+                (str(conf) if conf is not None else "-").ljust(6),
+                note
+            )
+        return
+
+    # Normal loop: per ticker -> LLM -> save in AI DB
+    print(f"Tickers loaded: {len(watch)} | Day window: {start_utc.isoformat()} -> {end_utc.isoformat()}")
+    print(f"Saving to: {MYSQL_DB_AI}.{MYSQL_TABLE_AI} (unique per run_date,ticker,model)\n")
+
+    for i, item in enumerate(watch, start=1):
+        ticker = item["ticker"]
+        name = item["name"]
+
+        print(f"[{i}/{len(watch)}] {ticker} ({name})")
+
+        try:
+            packet = build_packet(ticker, name, start_utc, end_utc)
+
+            analysis, perf, used_model = run_llm_with_optional_fallback(
+                client=client,
+                model=chosen_model,
+                packet=packet,
+                allow_retry=RETRY_ON_BAD_JSON,
+                fallback_model=FALLBACK_MODEL
+            )
+
+            row = {
+                "run_date": run_date,
+                "as_of_utc": as_of,
+                "ticker": ticker,
+                "company_name": name,
+                "model": used_model,
+                "stance": analysis.get("stance"),
+                "confidence_0_to_100": analysis.get("confidence_0_to_100"),
+                "recommendation_sentence": analysis.get("recommendation_sentence"),
+                "simplified": analysis,
+                "input_digest": {
+                    "window": packet.get("day_window_utc"),
+                    "news_count": len(packet.get("news_in_window") or []),
+                    "analyst_events_count": len((packet.get("analyst") or {}).get("events_in_window") or []),
+                    "bars_n": (packet.get("finance") or {}).get("bars_n"),
+                    "perf": perf,
+                    "primary_model": chosen_model,
+                    "fallback_model": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None,
+                },
+                "error": None,
+            }
+
+            upsert_ai_row(row)
+            print(f"  -> saved | model={used_model} stance={row['stance']} conf={row['confidence_0_to_100']}")
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)}"
+            row = {
+                "run_date": run_date,
+                "as_of_utc": as_of,
+                "ticker": ticker,
+                "company_name": name,
+                "model": chosen_model,
+                "stance": None,
+                "confidence_0_to_100": None,
+                "recommendation_sentence": None,
+                "simplified": None,
+                "input_digest": None,
+                "error": err,
+            }
+            upsert_ai_row(row)
+            print(f"  -> ERROR saved: {err}")
+
+        time.sleep(SLEEP_BETWEEN_TICKERS_S)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
