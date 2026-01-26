@@ -195,7 +195,7 @@ def analyze_article(client: OpenAI, model: str, article: dict) -> tuple[dict, di
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=700,
+        max_tokens=2000,
         stream=False,
     )
     elapsed = time.time() - start
