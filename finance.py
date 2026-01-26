@@ -14,11 +14,15 @@ import yfinance as yf
 import mysql.connector
 
 # ============================================================
-# REPO PATHS (GitHub folder-relative)
-# Adjust parents[1] if your script is not in repo/src/
+# REPO PATHS
 # ============================================================
-ROOT = Path(__file__).resolve().parents[1]          # repo root
-WATCHLIST_JSON = ROOT / "news_llm" / "json" / "tickers.json"     # JSON array of objects with "Ticker"
+# Assumption: this file lives in repo root OR repo/src/.
+# If your finance.py is in repo root -> parents[0] is repo root
+# If your finance.py is in repo/src/ -> parents[1] is repo root
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parents[1] if (THIS_FILE.parent.name in {"src", "scripts"}) else THIS_FILE.parents[0]
+
+WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "json" / "tickers.json")))
 
 # Sleep between remote calls (yfinance)
 SLEEP_BETWEEN_REQUESTS_S = float(os.getenv("SLEEP_BETWEEN_REQUESTS_S", "0.25"))
@@ -45,6 +49,10 @@ MYSQL_DB = os.getenv("MYSQL_DB", "Finance")
 MYSQL_TABLE_BARS = os.getenv("MYSQL_TABLE_FINANCE", "finance_ohlcv_cache")
 MYSQL_TABLE_ANALYST_SNAPSHOT = os.getenv("MYSQL_TABLE_ANALYST_SNAPSHOT", "analyst_snapshot")
 MYSQL_TABLE_ANALYST_EVENTS = os.getenv("MYSQL_TABLE_ANALYST_EVENTS", "analyst_events")
+
+# IMPORTANT:
+# We store interval in DB column `bar_interval` (NOT `interval`) to avoid SQL parsing/reserved-word issues.
+DB_INTERVAL_COL = "bar_interval"
 
 # ============================================================
 # INDICATORS
@@ -161,9 +169,6 @@ def json_safe(v):
     return v
 
 def build_deterministic_analyst_paragraph(snapshot: Dict[str, Any]) -> Optional[str]:
-    """
-    No LLM. Produces a compact paragraph from consensus fields.
-    """
     s = snapshot.get("summary") or {}
     rk = s.get("recommendationKey")
     rm = s.get("recommendationMean")
@@ -182,15 +187,14 @@ def build_deterministic_analyst_paragraph(snapshot: Dict[str, Any]) -> Optional[
     if tm is not None:
         parts.append(f"Target mean: {tm}.")
     if th is not None or tl is not None:
-        parts.append(f"Target range: {tl}–{th}." if (tl is not None and th is not None) else f"Target range: low={tl}, high={th}.")
+        parts.append(
+            f"Target range: {tl}–{th}."
+            if (tl is not None and th is not None)
+            else f"Target range: low={tl}, high={th}."
+        )
     return " ".join(parts) if parts else None
 
 def fetch_analyst_data(ticker: str) -> Dict[str, Any]:
-    """
-    Returns:
-      - snapshot (consensus + targets + company)
-      - events (upgrades/downgrades recent rows)
-    """
     t = yf.Ticker(ticker)
 
     info = {}
@@ -254,6 +258,7 @@ def mysql_connect(db: str | None = None):
     return mysql.connector.connect(**cfg)
 
 def ensure_db_and_tables():
+    # DB
     cnx = mysql_connect()
     cur = cnx.cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
@@ -263,12 +268,13 @@ def ensure_db_and_tables():
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor()
 
+    # OHLCV bars table (NOTE: bar_interval)
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE_BARS}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 
       ticker VARCHAR(32) NOT NULL,
-      interval VARCHAR(16) NOT NULL,
+      {DB_INTERVAL_COL} VARCHAR(16) NOT NULL,
       period VARCHAR(16) NOT NULL,
       ts_utc DATETIME NOT NULL,
 
@@ -289,12 +295,13 @@ def ensure_db_and_tables():
       fetched_at_utc DATETIME NULL,
 
       PRIMARY KEY (id),
-      UNIQUE KEY uniq_series (ticker, interval, period, ts_utc),
+      UNIQUE KEY uniq_series (ticker, {DB_INTERVAL_COL}, period, ts_utc),
       KEY idx_ts (ts_utc),
       KEY idx_ticker (ticker)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
 
+    # Analyst snapshot table
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE_ANALYST_SNAPSHOT}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -326,6 +333,7 @@ def ensure_db_and_tables():
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
 
+    # Analyst events table
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE_ANALYST_EVENTS}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -373,6 +381,8 @@ def to_mysql_dt(ts) -> Optional[datetime]:
     else:
         dt = pd.to_datetime(ts, errors="coerce").to_pydatetime()
 
+    if dt is None:
+        return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=None)
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
@@ -404,7 +414,7 @@ def upsert_bars(ticker: str, interval: str, period: str, df: pd.DataFrame) -> in
 
     sql = f"""
     INSERT INTO `{MYSQL_TABLE_BARS}` (
-      ticker, interval, period, ts_utc,
+      ticker, {DB_INTERVAL_COL}, period, ts_utc,
       open, high, low, close, volume,
       ema20, vwap, rsi14, macd_hist, bb_up, bb_mid, bb_low,
       fetched_at_utc
@@ -619,12 +629,9 @@ def insert_analyst_events(ticker: str, events: List[Dict[str, Any]]) -> int:
     return len(values)
 
 # ============================================================
-# CONFIG + STATE + RUNNERS (NEW)
+# ORCHESTRATION HELPERS (run_once / run_forever)
 # ============================================================
 def load_config(watchlist_path: Path = WATCHLIST_JSON) -> Dict[str, Any]:
-    """
-    Simple config loader for orchestration use.
-    """
     tickers = load_tickers_from_watchlist_json(watchlist_path)
     return {
         "tickers": tickers,
@@ -634,9 +641,6 @@ def load_config(watchlist_path: Path = WATCHLIST_JSON) -> Dict[str, Any]:
     }
 
 def build_state(cfg: Optional[Dict[str, Any]] = None, watchlist_path: Path = WATCHLIST_JSON) -> Dict[str, Any]:
-    """
-    Prepares runtime state; safe to reuse across run_once calls.
-    """
     if cfg is None:
         cfg = load_config(watchlist_path)
     ensure_db_and_tables()
@@ -660,7 +664,6 @@ def run_once(
     One full cycle over tickers:
       - optional analyst snapshot + events per ticker
       - optional OHLCV+indicators upsert per interval/period
-
     Returns summary dict (for logging).
     """
     if state is None:
@@ -680,25 +683,21 @@ def run_once(
     errors: List[str] = []
 
     for ticker in tickers:
-        # ---- Analyst
+        # Analyst
         if do_analyst:
             try:
                 analyst = fetch_analyst_data(ticker)
                 snapshot = analyst["snapshot"]
                 events = analyst["events"]
-
                 insert_analyst_snapshot(snapshot)
                 total_snapshots += 1
-
-                n_ev = insert_analyst_events(ticker, events)
-                total_events += n_ev
+                total_events += insert_analyst_events(ticker, events)
             except Exception as e:
                 errors.append(f"ANALYST_ERR {ticker}: {e}")
-
             if sleep_s:
                 time.sleep(sleep_s)
 
-        # ---- Bars
+        # Bars
         if do_bars:
             for interval, periods in fetch_plan:
                 for period in periods:
@@ -707,11 +706,9 @@ def run_once(
                         if df is None or df.empty:
                             continue
                         df2 = compute_indicators(df)
-                        n = upsert_bars(ticker, interval, period, df2)
-                        total_bars += n
+                        total_bars += upsert_bars(ticker, interval, period, df2)
                     except Exception as e:
                         errors.append(f"BARS_ERR {ticker} {interval} {period}: {e}")
-
                     if sleep_s:
                         time.sleep(sleep_s)
 
@@ -721,7 +718,7 @@ def run_once(
         "bars_upserted": total_bars,
         "analyst_snapshots": total_snapshots,
         "analyst_events": total_events,
-        "errors": errors[:50],  # cap
+        "errors": errors[:50],
         "ts_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -732,9 +729,6 @@ def run_forever(
     do_analyst: bool = True,
     do_bars: bool = True,
 ):
-    """
-    Convenience loop, if you want finance.py itself to run continuously.
-    """
     state = build_state(None, watchlist_path)
     while True:
         summary = run_once(state, watchlist_path, do_analyst=do_analyst, do_bars=do_bars)
@@ -759,7 +753,7 @@ def main():
     for ticker in tickers:
         print(f"\n=== {ticker} ===")
 
-        # ---- Analyst: snapshot + events
+        # Analyst: snapshot + events
         try:
             analyst = fetch_analyst_data(ticker)
             snapshot = analyst["snapshot"]
@@ -777,12 +771,12 @@ def main():
 
         time.sleep(SLEEP_BETWEEN_REQUESTS_S)
 
-        # ---- OHLCV + indicators
+        # OHLCV + indicators
         for interval, periods in FETCH_PLAN:
             for period in periods:
                 try:
                     df = fetch_ohlcv(ticker, interval, period)
-                    if df.empty:
+                    if df is None or df.empty:
                         print(f"  [MISS]   {interval} {period}")
                         continue
                     df2 = compute_indicators(df)
