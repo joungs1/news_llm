@@ -20,8 +20,6 @@ import mysql.connector
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 if not THENEWSAPI_TOKEN:
-    # You hardcoded a token in your original snippet; keeping env-first is safer.
-    # If you still want fallback, set it here.
     THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
 
 # MySQL "app login"
@@ -107,7 +105,6 @@ def build_ticker_search(ticker: str, name: Optional[str]) -> str:
     if base != t:
         terms.append(f"\"{base}\"")
 
-    # Use OR (your original)
     return " OR ".join(terms)
 
 def build_company_search(company_obj: dict) -> str:
@@ -116,7 +113,6 @@ def build_company_search(company_obj: dict) -> str:
         name = (company_obj.get("display_name") or company_obj.get("id") or "").strip()
         kws = [name] if name else []
     parts = [f"\"{k}\"" if " " in k else k for k in kws]
-    # Use | (your original)
     return " | ".join(parts)
 
 def safe_parse_published_at(published_at_val: Any) -> Optional[datetime]:
@@ -173,12 +169,16 @@ def mysql_connect(db: Optional[str] = None):
     return mysql.connector.connect(**cfg)
 
 def _index_exists(cur, table: str, index_name: str) -> bool:
+    # IMPORTANT: consume ALL rows to avoid "Unread result found"
     cur.execute(f"SHOW INDEX FROM `{table}` WHERE Key_name=%s", (index_name,))
-    return cur.fetchone() is not None
+    rows = cur.fetchall()  # clears result set
+    return len(rows) > 0
 
 def _column_exists(cur, table: str, col: str) -> bool:
+    # IMPORTANT: consume ALL rows to avoid "Unread result found"
     cur.execute(f"SHOW COLUMNS FROM `{table}` LIKE %s", (col,))
-    return cur.fetchone() is not None
+    rows = cur.fetchall()  # clears result set
+    return len(rows) > 0
 
 def ensure_table():
     """
@@ -186,17 +186,22 @@ def ensure_table():
       - allow same URL to be stored for multiple companies/tickers
       - do this by adding url_hash and unique(company, url_hash)
       - drop uniq_url if it exists (otherwise you can never store per-ticker rows)
+
+    Also applies FIX #3:
+      - avoid mysql.connector "Unread result found" by using buffered cursors
+        AND by consuming all rows in _index_exists/_column_exists.
     """
+    # --- Create DB ---
     cnx = mysql_connect()
-    cur = cnx.cursor()
+    cur = cnx.cursor(buffered=True)
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
     cur.close()
     cnx.close()
 
+    # --- Create / migrate table ---
     cnx = mysql_connect(MYSQL_DB)
-    cur = cnx.cursor()
+    cur = cnx.cursor(buffered=True)
 
-    # Create table if missing (original schema + url_hash)
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE}` (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -242,33 +247,45 @@ def ensure_table():
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
 
-    # If table existed before, ensure url_hash exists
-    if not _column_exists(cur, MYSQL_TABLE, "url_hash"):
-        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN url_hash VARCHAR(40) NULL AFTER url")
+    # --- Debug prints (so you can see progress) ---
+    print(f"[ensure_table] connected -> {MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} table={MYSQL_TABLE}")
 
-    # Drop old uniq_url if present (this is what prevents per-ticker storage)
-    if _index_exists(cur, MYSQL_TABLE, "uniq_url"):
+    # If table existed before, ensure url_hash exists
+    has_url_hash = _column_exists(cur, MYSQL_TABLE, "url_hash")
+    print(f"[ensure_table] column url_hash exists? {has_url_hash}")
+    if not has_url_hash:
+        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN url_hash VARCHAR(40) NULL AFTER url")
+        print("[ensure_table] added column url_hash")
+
+    # Drop old uniq_url if present
+    has_uniq_url = _index_exists(cur, MYSQL_TABLE, "uniq_url")
+    print(f"[ensure_table] index uniq_url exists? {has_uniq_url}")
+    if has_uniq_url:
         try:
             cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` DROP INDEX uniq_url")
-        except Exception:
-            # If it fails, we continue; but you will not get per-ticker rows until removed.
-            pass
+            print("[ensure_table] dropped index uniq_url")
+        except Exception as e:
+            print(f"[ensure_table] WARNING: failed to drop uniq_url: {type(e).__name__}: {e}")
 
     # Add new unique index on (company, url_hash)
-    if not _index_exists(cur, MYSQL_TABLE, "uniq_company_urlhash"):
+    has_new_uniq = _index_exists(cur, MYSQL_TABLE, "uniq_company_urlhash")
+    print(f"[ensure_table] index uniq_company_urlhash exists? {has_new_uniq}")
+    if not has_new_uniq:
         try:
             cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_company_urlhash (company(191), url_hash)")
-        except Exception:
-            pass
+            print("[ensure_table] added index uniq_company_urlhash (company(191), url_hash)")
+        except Exception as e:
+            print(f"[ensure_table] WARNING: failed to add uniq_company_urlhash: {type(e).__name__}: {e}")
 
     cur.close()
     cnx.close()
+    print("[ensure_table] done")
 
 def insert_rows(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     cnx = mysql_connect(MYSQL_DB)
-    cur = cnx.cursor()
+    cur = cnx.cursor(buffered=True)
 
     sql = f"""
     INSERT INTO `{MYSQL_TABLE}` (
@@ -359,26 +376,22 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
 # ============================================================
 
 def _resolve_thenewsapi_endpoint(cfg: dict) -> str:
-    # Backward compat: cfg.thenewsapi.endpoint
     api_cfg = (cfg.get("thenewsapi") or {})
     endpoint = (api_cfg.get("endpoint") or "").strip().lower()
     if endpoint in ("top", "all"):
         return endpoint
 
-    # New config: cfg.query.mode
     qmode = ((cfg.get("query") or {}).get("mode") or "").strip().lower()
     if qmode in ("everything", "all"):
         return "all"
     return "top"
 
 def _resolve_domains(cfg: dict) -> Tuple[List[str], List[str]]:
-    # Backward compat: cfg.thenewsapi.domains.include/exclude
     api_cfg = (cfg.get("thenewsapi") or {})
     dom = api_cfg.get("domains") or {}
     inc = dom.get("include") or []
     exc = dom.get("exclude") or []
 
-    # New config: cfg.sources.include/exclude
     src = cfg.get("sources") or {}
     if (src.get("mode") or "").strip().lower() == "domains":
         inc = src.get("include") or inc
@@ -392,8 +405,6 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
 
     polling = (cfg.get("polling") or {})
     language = polling.get("language", "en")
-
-    # Your new JSON uses page_size; old code used limit
     limit = int(polling.get("page_size", polling.get("limit", 50)))
 
     params: Dict[str, Any] = {
@@ -406,12 +417,10 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
         "page": 1,
     }
 
-    # Optional: search_fields from old cfg.thenewsapi.search_fields
     api_cfg = (cfg.get("thenewsapi") or {})
     if api_cfg.get("search_fields"):
         params["search_fields"] = api_cfg["search_fields"]
 
-    # Optional: locale from old config
     if api_cfg.get("locale"):
         params["locale"] = ",".join(api_cfg["locale"])
 
@@ -421,7 +430,6 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     if exclude_domains:
         params["exclude_domains"] = ",".join(exclude_domains)
 
-    # Optional categories from old config
     cats = api_cfg.get("categories") or {}
     if cats.get("include"):
         params["categories"] = ",".join(cats["include"])
@@ -432,7 +440,6 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     while True:
         r = requests.get(base, params=params, timeout=30)
         if r.status_code >= 400:
-            # print server message; this helps with 400 debugging
             raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:800]}", response=r)
         data = r.json() or {}
         items = data.get("data") or []
@@ -566,10 +573,8 @@ def build_runtime(cfg: dict) -> dict:
     preferred_model = model_cfg.get("preferred_model", "")
     fallback_idx = int(model_cfg.get("fallback_model_index", 0))
 
-    # macro companies
     companies = (cfg.get("query") or {}).get("companies") or []
 
-    # tickers (new config)
     tickers_cfg = cfg.get("tickers") or {}
     tickers_mode = (tickers_cfg.get("mode") or "").strip().lower()
     tickers_track = tickers_cfg.get("track") or []
@@ -599,9 +604,7 @@ def build_runtime(cfg: dict) -> dict:
         "model": chosen_model,
         "companies": companies,
         "tickers": tickers,
-        # dedupe ONLY for avoiding repeated LLM calls in same run:
-        # key is (company, url_hash)
-        "seen": set(),
+        "seen": set(),  # key is (company, url_hash)
         "last_poll": utc_now() - timedelta(minutes=lookback_minutes),
         "cycle": 0,
     }
@@ -735,7 +738,7 @@ def run_once() -> Tuple[int, datetime]:
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
-                    "company": ticker,  # IMPORTANT for ai.py joins
+                    "company": ticker,
 
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
