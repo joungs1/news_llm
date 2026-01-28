@@ -15,9 +15,9 @@ import dashboard
 # -------------------------
 # Schedules (seconds)
 # -------------------------
-NEWS_EVERY_S = int(os.getenv("NEWS_EVERY_S", "10000"))       # 5 min
+NEWS_EVERY_S = int(os.getenv("NEWS_EVERY_S", "20000"))       # 5 min
 FINANCE_EVERY_S = int(os.getenv("FINANCE_EVERY_S", "86400"))  # 1 day
-AI_EVERY_S = int(os.getenv("AI_EVERY_S", "36000"))         # 1 hour
+AI_EVERY_S = int(os.getenv("AI_EVERY_S", "10000"))         # 1 hour
 
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8000"))
