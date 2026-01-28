@@ -1,6 +1,6 @@
 {
   "polling": {
-    "interval_seconds": 120,
+    "interval_seconds": 600,
     "lookback_minutes": 1440,
     "language": "en",
     "limit": 50,
@@ -31,29 +31,149 @@
   "tickers": {
     "mode": "explicit",
     "track": [
-      { "name": "RBC", "ticker": "RY" },
-      { "name": "TD Bank", "ticker": "TD" },
-      { "name": "BMO", "ticker": "BMO" },
-      { "name": "Bell", "ticker": "BCE" },
-      { "name": "Telus", "ticker": "T" },
-      { "name": "Fortis", "ticker": "FTS" },
+      {
+        "name": "Royal Bank of Canada",
+        "ticker": "RY.TO",
+        "keywords": ["Royal Bank of Canada", "RBC", "RY.TO", "RY-TSX", "TSX:RY"]
+      },
+      {
+        "name": "Toronto-Dominion Bank",
+        "ticker": "TD.TO",
+        "keywords": ["Toronto-Dominion Bank", "TD Bank", "TD.TO", "TD-TSX", "TSX:TD"]
+      },
+      {
+        "name": "Bank of Montreal",
+        "ticker": "BMO.TO",
+        "keywords": ["Bank of Montreal", "BMO", "BMO.TO", "BMO-TSX", "TSX:BMO"]
+      },
+      {
+        "name": "BCE Inc",
+        "ticker": "BCE.TO",
+        "keywords": ["BCE", "Bell Canada", "BCE.TO", "BCE-TSX", "TSX:BCE"]
+      },
+      {
+        "name": "Telus Corporation",
+        "ticker": "T.TO",
+        "keywords": ["Telus", "Telus Corp", "T.TO", "T-TSX", "TSX:T"]
+      },
+      {
+        "name": "Fortis Inc",
+        "ticker": "FTS.TO",
+        "keywords": ["Fortis", "Fortis Inc", "FTS.TO", "FTS-TSX", "TSX:FTS"]
+      },
 
-      { "name": "Suncor", "ticker": "SU" },
-      { "name": "Canadian Natural Resources", "ticker": "CNQ" },
-      { "name": "Enbridge", "ticker": "ENB" },
-      { "name": "TC Energy", "ticker": "TRP" },
-      { "name": "Nutrien", "ticker": "NTR" },
-      { "name": "Shopify", "ticker": "SHOP" },
+      {
+        "name": "Suncor Energy",
+        "ticker": "SU.TO",
+        "keywords": ["Suncor", "Suncor Energy", "SU.TO", "SU-TSX", "TSX:SU"]
+      },
+      {
+        "name": "Canadian Natural Resources",
+        "ticker": "CNQ.TO",
+        "keywords": ["Canadian Natural Resources", "CNRL", "CNQ.TO", "CNQ-TSX", "TSX:CNQ"]
+      },
+      {
+        "name": "Enbridge",
+        "ticker": "ENB.TO",
+        "keywords": ["Enbridge", "ENB.TO", "ENB-TSX", "TSX:ENB"]
+      },
+      {
+        "name": "TC Energy",
+        "ticker": "TRP.TO",
+        "keywords": ["TC Energy", "TransCanada", "TRP.TO", "TRP-TSX", "TSX:TRP"]
+      },
+      {
+        "name": "Nutrien",
+        "ticker": "NTR.TO",
+        "keywords": ["Nutrien", "Nutrien Ltd", "NTR.TO", "NTR-TSX", "TSX:NTR"]
+      },
+      {
+        "name": "Shopify",
+        "ticker": "SHOP.TO",
+        "keywords": ["Shopify", "Shopify Inc", "SHOP.TO", "SHOP-TSX", "TSX:SHOP"]
+      },
 
-      { "name": "iShares U.S. Aggregate Bond ETF", "ticker": "XAGG" },
-      { "name": "Vanguard Canadian Aggregate Bond ETF", "ticker": "VAB" },
-      { "name": "iShares Emerging Markets Bond ETF", "ticker": "XEB" },
+      {
+        "name": "iShares U.S. Aggregate Bond ETF",
+        "ticker": "XAGG.TO",
+        "keywords": [
+          "iShares U.S. Aggregate Bond ETF",
+          "iShares US Aggregate Bond",
+          "XAGG",
+          "XAGG.TO"
+        ]
+      },
+      {
+        "name": "Vanguard Canadian Aggregate Bond ETF",
+        "ticker": "VAB.TO",
+        "keywords": [
+          "Vanguard Canadian Aggregate Bond ETF",
+          "Vanguard Canada Aggregate Bond",
+          "VAB",
+          "VAB.TO"
+        ]
+      },
+      {
+        "name": "iShares Emerging Markets Bond ETF",
+        "ticker": "XEB.TO",
+        "keywords": [
+          "iShares Emerging Markets Bond ETF",
+          "iShares EM Bond",
+          "XEB",
+          "XEB.TO"
+        ]
+      },
 
-      { "name": "Global X Uranium ETF", "ticker": "HURA" },
-      { "name": "iShares S&P/TSX Energy ETF", "ticker": "XEG" },
-      { "name": "iShares Global Gold ETF", "ticker": "XGD" },
-      { "name": "iShares Cybersecurity ETF", "ticker": "XHAK" },
-      { "name": "Evolve Cyber Security ETF", "ticker": "CYBR" }
+      {
+        "name": "Global X Uranium ETF",
+        "ticker": "HURA.TO",
+        "keywords": [
+          "Global X Uranium ETF",
+          "Uranium ETF",
+          "HURA",
+          "HURA.TO"
+        ]
+      },
+      {
+        "name": "iShares S&P/TSX Energy ETF",
+        "ticker": "XEG.TO",
+        "keywords": [
+          "iShares S&P/TSX Energy ETF",
+          "iShares TSX Energy",
+          "XEG",
+          "XEG.TO"
+        ]
+      },
+      {
+        "name": "iShares Global Gold ETF",
+        "ticker": "XGD.TO",
+        "keywords": [
+          "iShares Global Gold ETF",
+          "Gold Miners ETF",
+          "XGD",
+          "XGD.TO"
+        ]
+      },
+      {
+        "name": "iShares Cybersecurity ETF",
+        "ticker": "XHAK.TO",
+        "keywords": [
+          "iShares Cybersecurity ETF",
+          "Cybersecurity ETF",
+          "XHAK",
+          "XHAK.TO"
+        ]
+      },
+      {
+        "name": "Evolve Cyber Security ETF",
+        "ticker": "CYBR.TO",
+        "keywords": [
+          "Evolve Cyber Security ETF",
+          "Cybersecurity ETF Canada",
+          "CYBR",
+          "CYBR.TO"
+        ]
+      }
     ]
   },
 
@@ -61,25 +181,69 @@
     "endpoint": "all",
     "domains": {
       "include": [
+        /* =========================
+           CANADA – MAJOR MEDIA
+           ========================= */
+        "theglobeandmail.com",
+        "bnnbloomberg.ca",
+        "financialpost.com",
+        "thestar.com",
+        "cbc.ca",
+        "ctvnews.ca",
+        "globalnews.ca",
+      
+        /* =========================
+           CANADA – BUSINESS / ENERGY
+           ========================= */
+        "canadianbusiness.com",
+        "oilprice.com",
+        "energynewsbulletin.net",
+        "boereport.com",
+        "jwnenergy.com",
+        "pipelineonline.ca",
+        "mining.com",
+        "canadianminingjournal.com",
+        "northernminer.com",
+      
+        /* =========================
+           GLOBAL – WIRES / ANALYST STYLE
+           ========================= */
         "reuters.com",
         "bloomberg.com",
-        "apnews.com",
         "ft.com",
         "wsj.com",
         "marketwatch.com",
         "cnbc.com",
         "economist.com",
-        "theglobeandmail.com",
-        "bnnbloomberg.ca",
-        "financialpost.com",
-        "nytimes.com",
-        "washingtonpost.com",
-        "argusmedia.com",
+        "apnews.com",
+      
+        /* =========================
+           GLOBAL – RESEARCH / DATA PROVIDERS
+           ========================= */
         "spglobal.com",
         "spglobalenergy.com",
+        "argusmedia.com",
+        "morningstar.com",
+        "fitchratings.com",
+        "moodys.com",
+        "ratings.ihsmarkit.com",
+      
+        /* =========================
+           DEFENSE / MACRO / GEOPOL
+           ========================= */
         "defensenews.com",
-        "oilprice.com"
+        "breakingdefense.com",
+        "csis.org",
+        "rand.org",
+        "atlanticcouncil.org",
+      
+        /* =========================
+           GLOBAL FINANCE LONGFORM
+           ========================= */
+        "nytimes.com",
+        "washingtonpost.com"
       ],
+
       "exclude": [
         "reddit.com",
         "twitter.com",
