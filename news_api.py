@@ -2,44 +2,32 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 import time
+import re
 import hashlib
-import threading
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Dict, Any, List
 
 import requests
-import mysql.connector
 from openai import OpenAI
+
+# ============================================================
+# 🔧 SWITCH: LLM API MODE
+# ============================================================
+# False = /v1/responses  (Phi-3, DeepSeek, R1, non-chat)
+# True  = /v1/chat/completions (chat-only models)
+USE_CHAT_API = False
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN")
-MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
-MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
-MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
-MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
+OLLAMA_HOST = "http://100.88.217.85:11434"
+OLLAMA_MODEL = "phi3:latest"
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_CANDIDATES = [
-    Path(os.getenv("NEWS_JSON", "")) if os.getenv("NEWS_JSON") else None,
-    ROOT / "json" / "news.json",
-    ROOT / "news_llm" / "json" / "news.json",
-]
-DEFAULT_CONFIG_CANDIDATES = [p for p in DEFAULT_CONFIG_CANDIDATES if p]
-
-# Dashboard
-DASH_DIR = Path(os.getenv("NEWS_DASH_DIR", str(ROOT / "dashboard_data"))).resolve()
-DASH_PORT = int(os.getenv("NEWS_DASH_PORT", "8011"))
-DASH_ENABLE = True
+NEWS_JSON = "./news.json"
 
 # ============================================================
 # HELPERS
@@ -48,268 +36,167 @@ DASH_ENABLE = True
 def utc_now():
     return datetime.now(timezone.utc)
 
-def iso_z(dt: datetime) -> str:
-    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
 def sha1_hex(s: str) -> str:
-    return hashlib.sha1(s.encode()).hexdigest()
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
-def normalize_ticker(v):
-    if not v:
-        return ""
-    return str(v).strip().upper()
+def extract_json_object(text: str) -> Dict[str, Any]:
+    text = text.strip()
 
-def clean_keywords(kws):
-    if not kws:
-        return []
-    seen = set()
-    out = []
-    for k in kws:
-        k = str(k).strip()
-        if k and k.lower() not in seen:
-            seen.add(k.lower())
-            out.append(k)
-    return out
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
 
-# ============================================================
-# SEARCH BUILDERS (FIXED)
-# ============================================================
+    # fallback: extract first {...}
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON found")
 
-def build_company_search(c: dict) -> str:
-    kws = clean_keywords(c.get("keywords"))
-    if not kws:
-        name = c.get("display_name") or c.get("id")
-        kws = [name]
-    return " OR ".join(f"\"{k}\"" if " " in k else k for k in kws)
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
 
-def build_ticker_search(ticker: str, name: str, keywords: List[str]) -> str:
-    terms = [f"\"{name}\"", f"\"{ticker}\""]
-    base = ticker.split(".")[0]
-    if base != ticker:
-        terms.append(f"\"{base}\"")
-
-    for k in clean_keywords(keywords)[:8]:  # 🔑 CRITICAL
-        terms.append(f"\"{k}\"" if " " in k else k)
-
-    return " OR ".join(terms)
-
-# ============================================================
-# CONFIG LOAD
-# ============================================================
-
-def load_config():
-    for p in DEFAULT_CONFIG_CANDIDATES:
-        if p and p.exists():
-            with open(p, "r") as f:
-                cfg = json.load(f)
-            cfg["_loaded_from"] = str(p)
-            return cfg
-    raise FileNotFoundError("news.json not found")
-
-# ============================================================
-# MYSQL
-# ============================================================
-
-def mysql_connect(db=None):
-    return mysql.connector.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=db,
-        autocommit=True,
-    )
-
-def ensure_table():
-    cnx = mysql_connect()
-    cur = cnx.cursor()
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}`")
-    cur.close()
-    cnx.close()
-
-    cnx = mysql_connect(MYSQL_DB)
-    cur = cnx.cursor()
-    cur.execute(f"""
-    CREATE TABLE IF NOT EXISTS `{MYSQL_TABLE}` (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      company VARCHAR(255),
-      title TEXT,
-      url TEXT,
-      url_hash VARCHAR(40),
-      published_at DATETIME,
-      sentiment VARCHAR(16),
-      confidence INT,
-      summary TEXT,
-      direction VARCHAR(16),
-      horizon TEXT,
-      rationale TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_company_url (company(191), url_hash)
-    )
-    """)
-    cur.close()
-    cnx.close()
+    raise ValueError("Unclosed JSON object")
 
 # ============================================================
 # NEWS API
 # ============================================================
 
-def fetch_thenewsapi(cfg, search, after, before):
+def fetch_thenewsapi(search: str, after: datetime, before: datetime) -> List[dict]:
     url = "https://api.thenewsapi.com/v1/news/all"
+
     params = {
         "api_token": THENEWSAPI_TOKEN,
         "search": search,
         "language": "en",
         "published_after": after.strftime("%Y-%m-%dT%H:%M:%S"),
         "published_before": before.strftime("%Y-%m-%dT%H:%M:%S"),
-        "limit": cfg["polling"]["limit"],
+        "limit": 50,
     }
-
-    domains = cfg["thenewsapi"]["domains"].get("include")
-    if domains:
-        params["domains"] = ",".join(domains)
 
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    data = r.json().get("data", [])
-    return data
+    return r.json().get("data", [])
 
 # ============================================================
-# LLM
+# 🔴 LLM API — BOTH VERSIONS
 # ============================================================
 
-def analyze_article(client, model, article):
-    prompt = f"""
-Return ONLY JSON:
-{{
-  "sentiment": "positive|neutral|negative",
-  "confidence": 0-100,
-  "summary": "one sentence",
-  "market_impact": {{
-    "direction": "up|down|mixed|unclear",
-    "time_horizon": "intraday|days|weeks|months|unclear",
-    "rationale": "string"
-  }}
-}}
-
-Article:
-{json.dumps(article, ensure_ascii=False)}
-"""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=500,
+def analyze_article(client: OpenAI, article: dict):
+    prompt = (
+        "Return ONLY valid JSON.\n\n"
+        "Schema:\n"
+        "{\n"
+        '  "sentiment": "positive|neutral|negative",\n'
+        '  "confidence_0_to_100": 0,\n'
+        '  "one_sentence_summary": "string",\n'
+        '  "market_impact": {\n'
+        '    "direction": "up|down|mixed|unclear",\n'
+        '    "time_horizon": "intraday|days|weeks|months|unclear",\n'
+        '    "rationale": "string"\n'
+        "  }\n"
+        "}\n\n"
+        "Article:\n"
+        f"{json.dumps(article, ensure_ascii=False)}"
     )
-    return json.loads(resp.choices[0].message.content)
+
+    # ========================================================
+    # 🟡 OLD CHAT API (LEGACY)
+    # ========================================================
+    if USE_CHAT_API:
+        resp = client.chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=800,
+        )
+
+        text = resp.choices[0].message.content or ""
+        if not text.strip():
+            raise RuntimeError("Chat API returned empty output")
+
+        parsed = extract_json_object(text)
+        return parsed, text
+
+    # ========================================================
+    # ✅ NEW RESPONSES API (CORRECT FOR OLLAMA)
+    # ========================================================
+    resp = client.responses.create(
+        model=OLLAMA_MODEL,
+        input=prompt,
+        temperature=0.2,
+        max_output_tokens=800,
+    )
+
+    text = ""
+    for item in resp.output:
+        if item["type"] == "message":
+            for c in item["content"]:
+                if c["type"] == "output_text":
+                    text += c["text"]
+
+    if not text.strip():
+        raise RuntimeError("Responses API returned empty output")
+
+    parsed = extract_json_object(text)
+    return parsed, text
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
-def run_once():
-    cfg = load_config()
-    ensure_table()
+def main():
+    print("RUNNING FILE:", __file__)
+    print("USE_CHAT_API =", USE_CHAT_API)
 
-    client = OpenAI(base_url=f"{cfg['model']['host']}/v1", api_key="ollama")
-    model = cfg["model"]["preferred_model"]
+    with open(NEWS_JSON, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
 
-    lookback = timedelta(minutes=cfg["polling"]["lookback_minutes"])
-    start = utc_now() - lookback
-    end = utc_now()
+    companies = cfg["query"]["companies"]
+    tickers = cfg["tickers"]["track"]
 
-    cnx = mysql_connect(MYSQL_DB)
-    cur = cnx.cursor()
+    client = OpenAI(
+        base_url=f"{OLLAMA_HOST}/v1",
+        api_key="ollama"
+    )
 
-    # ---------------- MACRO ----------------
-    for c in cfg["query"]["companies"]:
+    now = utc_now()
+    after = now - timedelta(hours=6)
+
+    # =======================
+    # COMPANIES
+    # =======================
+    for c in companies:
         label = c["display_name"]
-        search = build_company_search(c)
-        print(f"[macro] {label}")
-        articles = fetch_thenewsapi(cfg, search, start, end)
-        print(f"  fetched={len(articles)}")
+        search = " OR ".join(c["keywords"])
 
-        for a in articles:
-            url = a.get("url")
-            if not url:
-                continue
-            h = sha1_hex(url)
+        print(f"\n[COMPANY] {label}")
+        articles = fetch_thenewsapi(search, after, now)
 
-            out = analyze_article(client, model, a)
-            mi = out["market_impact"]
+        for a in articles[:3]:
+            parsed, raw = analyze_article(client, a)
+            print("RAW LLM TEXT:", raw[:200], "...")
+            print("PARSED JSON:", parsed)
 
-            cur.execute(
-                f"""
-                INSERT IGNORE INTO `{MYSQL_TABLE}`
-                (company, title, url, url_hash, published_at,
-                 sentiment, confidence, summary,
-                 direction, horizon, rationale)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    label,
-                    a.get("title"),
-                    url,
-                    h,
-                    a.get("published_at"),
-                    out["sentiment"],
-                    out["confidence"],
-                    out["summary"],
-                    mi["direction"],
-                    mi["time_horizon"],
-                    mi["rationale"],
-                ),
-            )
+    # =======================
+    # TICKERS
+    # =======================
+    for t in tickers:
+        label = t["ticker"]
+        search = " OR ".join(t["keywords"][:10])
 
-    # ---------------- TICKERS ----------------
-    for t in cfg["tickers"]["track"]:
-        ticker = normalize_ticker(t["ticker"])
-        name = t["name"]
-        search = build_ticker_search(ticker, name, t["keywords"])
+        print(f"\n[TICKER] {label}")
+        articles = fetch_thenewsapi(search, after, now)
 
-        print(f"[ticker] {ticker} ({name})")
-        articles = fetch_thenewsapi(cfg, search, start, end)
-        print(f"  fetched={len(articles)}")
-
-        for a in articles:
-            url = a.get("url")
-            if not url:
-                continue
-            h = sha1_hex(url)
-
-            out = analyze_article(client, model, a)
-            mi = out["market_impact"]
-
-            cur.execute(
-                f"""
-                INSERT IGNORE INTO `{MYSQL_TABLE}`
-                (company, title, url, url_hash, published_at,
-                 sentiment, confidence, summary,
-                 direction, horizon, rationale)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    ticker,
-                    a.get("title"),
-                    url,
-                    h,
-                    a.get("published_at"),
-                    out["sentiment"],
-                    out["confidence"],
-                    out["summary"],
-                    mi["direction"],
-                    mi["time_horizon"],
-                    mi["rationale"],
-                ),
-            )
-
-    cur.close()
-    cnx.close()
-    print("DONE")
-
-# ============================================================
-# ENTRY
-# ============================================================
+        for a in articles[:3]:
+            parsed, raw = analyze_article(client, a)
+            print("RAW LLM TEXT:", raw[:200], "...")
+            print("PARSED JSON:", parsed)
 
 if __name__ == "__main__":
-    run_once()
+    main()
