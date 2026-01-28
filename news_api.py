@@ -521,7 +521,7 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     while True:
         r = requests.get(base, params=params, timeout=30)
         if r.status_code >= 400:
-            raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:800]}", response=r)
+            raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:1250]}", response=r)
 
         data = r.json() or {}
         items = data.get("data") or []
