@@ -30,7 +30,7 @@
     "name": "f268abb4e7a5"
   },
   "tickers": {
-    "mode": "explicit",
+    "mode": "everything",
     "track": [
       {
         "name": "iShares U.S. Aggregate Bond Index ETF",
