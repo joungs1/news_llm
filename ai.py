@@ -430,22 +430,89 @@ def is_stale_ts(ts_iso: Optional[str]) -> bool:
         return True
 
 # ============================================================
-# NEWS (alias-aware)
+# NEWS (alias-aware) - USE STORED LLM RESPONSE, DO NOT INCLUDE FULL ARTICLE TEXT
 # ============================================================
 
-def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
-    cnx = mysql_connect(DB_NEWS)
-    cur = cnx.cursor(dictionary=True)
-    cur.execute(f"""
-      SELECT timestamp_utc, published_at, source, title, url,
-             one_sentence_summary, sentiment, confidence_0_to_100
+def _table_has_column(db: str, table: str, col: str) -> bool:
+    cnx = mysql_connect(db)
+    cur = cnx.cursor()
+    cur.execute(f"SHOW COLUMNS FROM `{table}` LIKE %s", (col,))
+    ok = cur.fetchone() is not None
+    cur.close()
+    cnx.close()
+    return ok
+
+_NEWS_SCHEMA: Optional[Dict[str, bool]] = None
+
+def get_news_schema() -> Dict[str, bool]:
+    global _NEWS_SCHEMA
+    if _NEWS_SCHEMA is not None:
+        return _NEWS_SCHEMA
+
+    cols = [
+        "company",
+        "entity_id", "entity_type", "display_name",
+        "timestamp_utc", "published_at", "source", "title", "url",
+        "one_sentence_summary", "sentiment", "confidence_0_to_100",
+        "analysis_json", "llm_raw_text",
+        "error",
+        "market_direction", "market_time_horizon", "market_rationale",
+    ]
+    schema: Dict[str, bool] = {}
+    for c in cols:
+        try:
+            schema[c] = _table_has_column(DB_NEWS, T_NEWS, c)
+        except Exception:
+            schema[c] = False
+
+    _NEWS_SCHEMA = schema
+    return schema
+
+def fetch_news_in_window(news_key: str, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    """
+    Query by:
+      - entity_id if present (new schema)
+      - else company if present (old schema)
+    Only pull stored LLM outputs; NO original article full text.
+    """
+    sch = get_news_schema()
+
+    select_cols: List[str] = []
+    for c in [
+        "timestamp_utc", "published_at", "source", "title", "url",
+        "one_sentence_summary", "sentiment", "confidence_0_to_100",
+        "market_direction", "market_time_horizon", "market_rationale",
+        "analysis_json", "llm_raw_text",
+        "display_name", "entity_type", "entity_id",
+        "error",
+    ]:
+        if sch.get(c):
+            select_cols.append(c)
+
+    if not select_cols:
+        return []
+
+    where_key_col = "entity_id" if sch.get("entity_id") else ("company" if sch.get("company") else None)
+    if not where_key_col:
+        return []
+
+    error_filter = "1=1"
+    if sch.get("error"):
+        error_filter = "(error IS NULL OR error = '')"
+
+    q = f"""
+      SELECT {", ".join(select_cols)}
       FROM `{T_NEWS}`
-      WHERE company=%s
+      WHERE `{where_key_col}`=%s
         AND timestamp_utc >= %s AND timestamp_utc < %s
-        AND (error IS NULL OR error = '')
+        AND {error_filter}
       ORDER BY timestamp_utc DESC
       LIMIT %s
-    """, (company_key, dt_utc_naive(start_utc), dt_utc_naive(end_utc), NEWS_LIMIT))
+    """
+
+    cnx = mysql_connect(DB_NEWS)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute(q, (news_key, dt_utc_naive(start_utc), dt_utc_naive(end_utc), NEWS_LIMIT))
     rows = cur.fetchall()
     cur.close()
     cnx.close()
@@ -453,7 +520,8 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
     for r in rows:
         if isinstance(r.get("timestamp_utc"), datetime):
             r["timestamp_utc"] = r["timestamp_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-        # optional: normalize any other datetime fields
+        if isinstance(r.get("published_at"), datetime):
+            r["published_at"] = r["published_at"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
         _normalize_row_datetimes_in_place(r)
 
     return rows
@@ -582,10 +650,35 @@ def summarize_finance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 # ============================================================
-# PACKET SLIMMING (LLM input)
+# PACKET SLIMMING (LLM input) - DO NOT INCLUDE FULL ARTICLE TEXT
 # ============================================================
 
+def _json_preview(v: Any, max_chars: int = 1400) -> Any:
+    if v is None:
+        return None
+    # If DB stored JSON as string, keep as string but cap length
+    s = v if isinstance(v, str) else json.dumps(json_sanitize(v), ensure_ascii=False)
+    if len(s) > max_chars:
+        return s[:max_chars] + "…[TRUNCATED]"
+    return s
+
+def _text_preview(v: Any, max_chars: int = 900) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+    if len(s) > max_chars:
+        return s[:max_chars] + "…[TRUNCATED]"
+    return s
+
 def slim_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Key change you requested:
+      - Use stored LLM response fields from news table (analysis_json + llm_raw_text)
+      - DO NOT include full_text / original article body (reduces tokens)
+    """
     news = packet.get("news_rows") or []
     news_small: List[Dict[str, Any]] = []
     for n in news[:3]:
@@ -594,11 +687,22 @@ def slim_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         news_small.append({
             "source": n.get("source"),
             "title": n.get("title"),
+            "published_at": n.get("published_at"),
+            "url": n.get("url"),
+
+            # Old summary fields (if present)
             "sentiment": n.get("sentiment"),
             "confidence_0_to_100": n.get("confidence_0_to_100"),
             "one_sentence_summary": n.get("one_sentence_summary"),
-            "published_at": n.get("published_at"),
-            "url": n.get("url"),
+
+            # Market impact (if present)
+            "market_direction": n.get("market_direction"),
+            "market_time_horizon": n.get("market_time_horizon"),
+            "market_rationale": _text_preview(n.get("market_rationale"), 700),
+
+            # ✅ Stored LLM artifacts (bounded)
+            "analysis_json": _json_preview(n.get("analysis_json"), 1400),
+            "llm_raw_text": _text_preview(n.get("llm_raw_text"), 900),
         })
 
     return {
@@ -814,7 +918,7 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
 
             fin_summary_15m = summarize_finance(bars_15m_full)
 
-            # News: try name + ticker variants
+            # News: try name + ticker variants (now pulls LLM artifacts, not full article text)
             matched_news_key, news_rows = fetch_news_any_key(name, ticker, start_utc, end_utc)
 
             packet = {
@@ -916,7 +1020,6 @@ def run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int] = N
     Your repo expects ai.run_once(), so keep this stable.
     """
     return main_run_once(run_date=run_date, max_tickers=max_tickers)
-
 
 def main():
     summary = run_once()
