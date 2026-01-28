@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import ast
 import time
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -610,12 +611,26 @@ def fetch_full_article_text(url: str) -> Tuple[Optional[str], Optional[str]]:
 # ============================================================
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    if not text or not text.strip():
+    """
+    Robustly parse a dict-like JSON object from model output.
+
+    Handles:
+      - Strict JSON (double quotes)
+      - Markdown ``` fences
+      - Python-literal dicts (single quotes) via ast.literal_eval
+      - Common "almost JSON" issues (unquoted keys, single-quoted strings, trailing commas)
+    """
+    if not text or not str(text).strip():
         raise ValueError("Empty model response")
 
-    raw = text.strip()
+    raw = str(text).strip()
 
-    # direct JSON
+    # Strip ``` fences first (models love wrapping JSON)
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+
+    # 1) direct JSON
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
@@ -623,11 +638,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # strip ``` blocks
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
-        raw = re.sub(r"\s*```\s*$", "", raw).strip()
-
+    # 2) locate the first complete {...} object by brace matching
     start = raw.find("{")
     if start == -1:
         raise ValueError("Could not locate JSON in model output")
@@ -635,12 +646,13 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     depth = 0
     in_str = False
     esc = False
+    end = None
     for i in range(start, len(raw)):
         ch = raw[i]
         if in_str:
             if esc:
                 esc = False
-            elif ch == "\\":
+            elif ch == "\\":  # escape
                 esc = True
             elif ch == '"':
                 in_str = False
@@ -652,9 +664,55 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return json.loads(raw[start:i + 1])
+                    end = i + 1
+                    break
 
-    raise ValueError("Found '{' but could not extract a complete JSON object")
+    if end is None:
+        raise ValueError("Found '{' but could not extract a complete JSON object")
+
+    obj_str = raw[start:end].strip()
+
+    # 3) try strict JSON on the extracted object
+    try:
+        obj = json.loads(obj_str)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 4) try Python-literal parsing (single quotes etc.)
+    try:
+        lit = ast.literal_eval(obj_str)
+        if isinstance(lit, dict):
+            # ensure JSON-serializable
+            return json.loads(json.dumps(lit, ensure_ascii=False))
+    except Exception:
+        pass
+
+    # 5) last resort: heuristic "jsonify" then parse
+    #    - remove trailing commas
+    s = re.sub(r",\s*([}\]])", r"\1", obj_str)
+
+    #    - quote unquoted keys: {foo: 1, bar_baz: "x"} -> {"foo": 1, "bar_baz": "x"}
+    s = re.sub(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', s)
+
+    #    - convert single-quoted strings to JSON double-quoted strings
+    #      This targets common cases like 'neutral' or 'months'
+    def _sq_to_dq(m: re.Match) -> str:
+        inner = m.group(1)
+        inner = inner.replace('\\', '\\\\').replace('"', '\\\"')
+        return '"' + inner + '"'
+
+    s = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", _sq_to_dq, s)
+
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception as e:
+        # include a small preview to help debugging (caller should store raw separately)
+        preview = obj_str[:300].replace("\n", " ")
+        raise ValueError(f"Could not parse JSON from model output: {type(e).__name__}: {e} | preview={preview}")
 
 def build_llm_input_text(article: dict, full_text: Optional[str]) -> str:
     parts: List[str] = []
