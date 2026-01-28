@@ -28,7 +28,7 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD","B612b612@")
 MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
 
- news.json discovery
+# news.json discovery
 ROOT = Path(__file__).resolve().parents[0]
 DEFAULT_CONFIG_CANDIDATES = [
     Path(os.getenv("NEWS_JSON", "")) if os.getenv("NEWS_JSON") else None,
