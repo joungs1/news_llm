@@ -56,8 +56,8 @@ SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()        # IMPORTANT: u
 # Full-text extraction guardrails
 FULLTEXT_ENABLE = os.getenv("NEWS_FULLTEXT_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
 FULLTEXT_TIMEOUT_S = int(os.getenv("NEWS_FULLTEXT_TIMEOUT_S", "20"))
-FULLTEXT_MAX_CHARS = int(os.getenv("NEWS_FULLTEXT_MAX_CHARS", "18000"))
-LLM_INPUT_MAX_CHARS = int(os.getenv("NEWS_LLM_INPUT_MAX_CHARS", "2400"))
+FULLTEXT_MAX_CHARS = int(os.getenv("NEWS_FULLTEXT_MAX_CHARS", "5000"))
+LLM_INPUT_MAX_CHARS = int(os.getenv("NEWS_LLM_INPUT_MAX_CHARS", "3000"))
 BAD_OUTPUT_MAX_CHARS = int(os.getenv("NEWS_BAD_OUTPUT_MAX_CHARS", "1200"))
 HTTP_UA = os.getenv(
     "NEWS_HTTP_USER_AGENT",
