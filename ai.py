@@ -52,8 +52,8 @@ BARS_LIMIT_15M = int(os.getenv("BARS_LIMIT_15M", "200"))  # 1d of 15m ~ 26–30 
 
 # LLM tuning (max_tokens = OUTPUT tokens only)
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "180"))
-LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "30"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1000"))
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "200"))
 FORCE_JSON_MODE = os.getenv("FORCE_JSON_MODE", "1").strip() == "1"
 
 # Prompt / row size guardrails
