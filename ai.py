@@ -53,12 +53,20 @@ BARS_PERIOD = os.getenv("BARS_PERIOD", "6mo")
 # Pacing
 SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
 
-# Retry on bad JSON / bad content (ticker mismatch) with fallback
+# Retry on bad JSON with fallback
 RETRY_ON_BAD_JSON = os.getenv("RETRY_ON_BAD_JSON", "1").strip() == "1"
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "deepseek-r1:latest")
 
 # If your Ollama OpenAI-compatible server supports response_format JSON mode.
 FORCE_JSON_MODE = os.getenv("FORCE_JSON_MODE", "1").strip() == "1"
+
+# LLM tuning (IMPORTANT: max_tokens is OUTPUT tokens only)
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "180"))
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "30"))
+
+# Prompt input guard (hard cap characters; keeps local models from stalling)
+PROMPT_CHAR_BUDGET = int(os.getenv("PROMPT_CHAR_BUDGET", "12000"))
 
 # ============================================================
 # TIME HELPERS
@@ -128,6 +136,19 @@ def load_watchlist(path: Path) -> List[Dict[str, str]]:
             "name": str(row.get("Potential") or row.get("display_name") or t).strip()
         })
     return out
+
+def load_known_tickers() -> set[str]:
+    """
+    Used ONLY for soft validation (avoid false positives like 'A', 'BO', etc).
+    If file missing/unreadable, returns empty set (no cross-ticker policing).
+    """
+    try:
+        wl = load_watchlist(WATCHLIST_JSON)
+        return {w["ticker"].upper() for w in wl if w.get("ticker")}
+    except Exception:
+        return set()
+
+_KNOWN_TICKERS = load_known_tickers()
 
 # ============================================================
 # MYSQL
@@ -238,9 +259,6 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
 
 # ============================================================
 # FINANCE BARS: SCHEMA-AWARE FILTERING
-#   Fixes:
-#   - your table uses bar_interval (not interval)
-#   - period exists
 # ============================================================
 
 _BARS_FILTER_COLS: Optional[Dict[str, Optional[str]]] = None
@@ -375,30 +393,118 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = raw[start:i+1].strip()
+                    candidate = raw[start:i + 1].strip()
                     return json.loads(candidate)
 
     raise ValueError("Found '{' but could not extract a complete JSON object")
 
 # ============================================================
-# OUTPUT VALIDATION (prevents AAPL leakage)
+# INPUT SLIMMING (keeps prompt small & fast)
 # ============================================================
 
-_TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def summarize_finance(tail: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Turn raw tail bars into a small deterministic feature packet.
+    Avoids sending big arrays to the LLM.
+    """
+    if not tail:
+        return {"available": False}
+
+    closes: List[float] = []
+    for b in tail:
+        c = _safe_float(b.get("close"))
+        if c is not None:
+            closes.append(c)
+
+    last = tail[-1]
+    last_close = _safe_float(last.get("close"))
+    ret_1 = None
+    ret_5 = None
+    if len(closes) >= 2 and last_close is not None and closes[-2] not in (None, 0):
+        ret_1 = (last_close / closes[-2] - 1.0) * 100.0
+    if len(closes) >= 6 and last_close is not None and closes[-6] not in (None, 0):
+        ret_5 = (last_close / closes[-6] - 1.0) * 100.0
+
+    ema20 = _safe_float(last.get("ema20"))
+    vwap = _safe_float(last.get("vwap"))
+    rsi = _safe_float(last.get("rsi14"))
+    macd_hist = _safe_float(last.get("macd_hist"))
+
+    trend = None
+    if last_close is not None and ema20 is not None:
+        trend = "above_ema20" if last_close > ema20 else "below_ema20"
+
+    return {
+        "available": True,
+        "bars_used": len(tail),
+        "last_ts_utc": last.get("ts_utc"),
+        "last_close": last_close,
+        "ret_1_bar_pct": None if ret_1 is None else round(ret_1, 3),
+        "ret_5_bar_pct": None if ret_5 is None else round(ret_5, 3),
+        "ema20": ema20,
+        "vwap": vwap,
+        "rsi14": rsi,
+        "macd_hist": macd_hist,
+        "trend": trend,
+    }
+
+def slim_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep only what the model needs. This is the main fix for
+    "input JSON might be a lot" concerns.
+    """
+    ticker = str(packet.get("ticker") or "").strip()
+    name = str(packet.get("company_name") or "").strip()
+
+    finance = packet.get("finance") or {}
+    tail = finance.get("tail_30") or []
+    if not isinstance(tail, list):
+        tail = []
+
+    news = packet.get("news_in_window") or []
+    if not isinstance(news, list):
+        news = []
+
+    news_small: List[Dict[str, Any]] = []
+    for n in news[:3]:
+        if not isinstance(n, dict):
+            continue
+        news_small.append({
+            "source": n.get("source"),
+            "title": n.get("title"),
+            "sentiment": n.get("sentiment"),
+            "confidence_0_to_100": n.get("confidence_0_to_100"),
+            "one_sentence_summary": n.get("one_sentence_summary"),
+            "published_at": n.get("published_at"),
+            "url": n.get("url"),
+        })
+
+    return {
+        "ticker": ticker,
+        "company_name": name,
+        "window_utc": packet.get("day_window_utc"),
+        "finance_summary": summarize_finance(tail[-30:]),
+        "news_top_3": news_small,
+    }
+
+# ============================================================
+# OUTPUT VALIDATION (SIMPLIFIED + ROBUST)
+# ============================================================
 
 def validate_llm_output(out: Dict[str, Any], expected_ticker: str) -> Dict[str, Any]:
     if not isinstance(out, dict):
         raise ValueError("LLM output is not a JSON object")
 
-    required = (
-        "ticker",
-        "stance",
-        "confidence_0_to_100",
-        "recommendation_sentence",
-        "key_drivers",
-        "risks",
-        "what_to_watch_next",
-    )
+    # Minimal required keys (this is the key simplification)
+    required = ("ticker", "stance", "confidence_0_to_100", "recommendation_sentence", "time_horizon")
     missing = [k for k in required if k not in out]
     if missing:
         raise ValueError(f"LLM output missing fields: {missing}")
@@ -407,30 +513,43 @@ def validate_llm_output(out: Dict[str, Any], expected_ticker: str) -> Dict[str, 
     if got_ticker != expected_ticker:
         raise ValueError(f"Ticker mismatch: expected={expected_ticker} got={got_ticker}")
 
-    stance = out.get("stance")
+    stance = str(out.get("stance") or "").strip().lower()
     if stance not in ("bullish", "neutral", "bearish"):
         raise ValueError(f"Invalid stance: {stance}")
-
-    rec = str(out.get("recommendation_sentence") or "").strip()
-    if not rec:
-        raise ValueError("Empty recommendation_sentence")
-
-    mentioned = set(_TICKER_RE.findall(rec.upper()))
-    mentioned.discard(expected_ticker.upper())
-    for noise in {"USD", "CAD", "ETF", "CEO"}:
-        mentioned.discard(noise)
-    if mentioned:
-        raise ValueError(f"Recommendation mentions other ticker(s): {sorted(mentioned)[:5]}")
+    out["stance"] = stance
 
     try:
         out["confidence_0_to_100"] = max(0, min(100, int(out["confidence_0_to_100"])))
     except Exception:
         raise ValueError("Invalid confidence_0_to_100")
 
-    # Ensure lists are lists
-    for lk in ("key_drivers", "risks", "what_to_watch_next"):
-        if not isinstance(out.get(lk), list):
-            raise ValueError(f"{lk} must be a list")
+    th = str(out.get("time_horizon") or "").strip().lower()
+    if th not in ("intraday", "days", "weeks"):
+        # normalize unknowns rather than failing
+        th = "days"
+    out["time_horizon"] = th
+
+    rec = str(out.get("recommendation_sentence") or "").strip()
+    if not rec:
+        raise ValueError("Empty recommendation_sentence")
+    if len(rec) > 220:
+        rec = rec[:220].rstrip()
+    out["recommendation_sentence"] = rec
+
+    # SOFT cross-ticker check: only against known watchlist tickers, never regex ALL-CAPS.
+    # And: do NOT fail the whole row (no more "neutral due to A").
+    if _KNOWN_TICKERS:
+        upper = rec.upper()
+        others = []
+        for t in _KNOWN_TICKERS:
+            if t == expected_ticker.upper():
+                continue
+            if re.search(rf"\b{re.escape(t)}\b", upper):
+                others.append(t)
+                if len(others) >= 3:
+                    break
+        if others:
+            out["_note"] = f"rec_mentions_other_tracked_tickers={others}"
 
     return out
 
@@ -438,45 +557,73 @@ def validate_llm_output(out: Dict[str, Any], expected_ticker: str) -> Dict[str, 
 # LLM (OpenAI-compatible via Ollama)
 # ============================================================
 
-def build_prompt(packet: Dict[str, Any]) -> str:
+def build_prompt(packet: Dict[str, Any]) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """
+    Returns (messages, input_digest).
+    """
+    expected_ticker = str(packet.get("ticker") or "").strip()
+
+    slim = slim_packet(packet)
+
     schema = {
         "ticker": "MUST equal input ticker exactly",
         "stance": "bullish|neutral|bearish",
-        "confidence_0_to_100": 0,
-        "recommendation_sentence": "ONE sentence. MUST mention the input ticker (not another ticker).",
-        "key_drivers": ["string", "string", "string"],
-        "risks": ["string", "string", "string"],
-        "what_to_watch_next": ["string", "string", "string"],
+        "confidence_0_to_100": "integer 0..100",
+        "time_horizon": "intraday|days|weeks",
+        "recommendation_sentence": "ONE sentence, max 220 chars. Do NOT mention other tickers.",
     }
-    return (
-        "Return ONLY valid JSON. No markdown.\n\n"
-        "You are an investment monitoring assistant. Use ONLY the provided input.\n"
-        "Do not invent facts. If evidence is insufficient, be neutral and say what is missing.\n"
-        "CRITICAL: Output must be about the input ticker only.\n\n"
-        f"Required JSON schema:\n{json.dumps(schema, indent=2)}\n\n"
-        "Input packet:\n"
-        f"{json.dumps(packet, ensure_ascii=False)}"
+
+    system = (
+        "You are a JSON API. Output ONLY valid JSON. No markdown. No extra keys. "
+        "Do not include any text outside the JSON object."
     )
+
+    user = (
+        "Return ONE JSON object with EXACT keys and allowed values.\n"
+        f"Schema:\n{json.dumps(schema, indent=2)}\n\n"
+        "Rules:\n"
+        f"- ticker MUST equal: {expected_ticker}\n"
+        "- Use ONLY the provided input.\n"
+        "- If evidence is insufficient, choose stance='neutral' and explain what is missing.\n\n"
+        f"Input:\n{json.dumps(slim, ensure_ascii=False)}"
+    )
+
+    # Hard cap input size (character-based; simple & effective)
+    if len(user) > PROMPT_CHAR_BUDGET:
+        user = user[:PROMPT_CHAR_BUDGET] + "\n\n[TRUNCATED_INPUT]"
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    input_digest = {
+        "packet_slim": slim,
+        "prompt_char_budget": PROMPT_CHAR_BUDGET,
+        "used_chars": len(user),
+    }
+    return messages, input_digest
 
 def neutral_fallback(reason: str, expected_ticker: str) -> Dict[str, Any]:
     return {
         "ticker": expected_ticker,
         "stance": "neutral",
         "confidence_0_to_100": 10,
+        "time_horizon": "days",
         "recommendation_sentence": f"{expected_ticker}: Neutral due to insufficient/invalid model output: {reason}",
-        "key_drivers": ["Insufficient structured signal from inputs"],
-        "risks": ["Model output parsing failure, ticker mismatch, or missing data"],
-        "what_to_watch_next": ["Verify finance/news ingestion and JSON output settings"],
     }
 
-def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str, Any]:
+def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     expected_ticker = str(packet.get("ticker") or "").strip()
+    messages, input_digest = build_prompt(packet)
+
     kwargs: Dict[str, Any] = dict(
         model=model,
-        messages=[{"role": "user", "content": build_prompt(packet)}],
-        temperature=0.0,
-        max_tokens=650,
+        messages=messages,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
         stream=False,
+        timeout=LLM_TIMEOUT_S,
     )
 
     # Attempt JSON mode if supported; if not supported, fall through.
@@ -485,20 +632,20 @@ def run_llm_once(client: OpenAI, model: str, packet: Dict[str, Any]) -> Dict[str
             resp = client.chat.completions.create(**kwargs, response_format={"type": "json_object"})
             text = (resp.choices[0].message.content or "").strip()
             out = extract_json_object(text)
-            return validate_llm_output(out, expected_ticker)
+            return validate_llm_output(out, expected_ticker), input_digest
         except Exception:
             pass
 
     resp = client.chat.completions.create(**kwargs)
     text = (resp.choices[0].message.content or "").strip()
     out = extract_json_object(text)
-    return validate_llm_output(out, expected_ticker)
+    return validate_llm_output(out, expected_ticker), input_digest
 
 def run_llm_with_optional_fallback(
     client: OpenAI, model: str, packet: Dict[str, Any]
-) -> Tuple[Dict[str, Any], str, Optional[str]]:
+) -> Tuple[Dict[str, Any], str, Optional[str], Dict[str, Any]]:
     """
-    Returns (output, used_model, note).
+    Returns (output, used_model, note, input_digest).
     Retries on:
       - invalid JSON
       - ticker mismatch
@@ -507,19 +654,18 @@ def run_llm_with_optional_fallback(
     expected_ticker = str(packet.get("ticker") or "").strip()
 
     try:
-        out = run_llm_once(client, model, packet)
-        return out, model, None
+        out, digest = run_llm_once(client, model, packet)
+        return out, model, None, digest
     except Exception as e1:
         if not RETRY_ON_BAD_JSON or not FALLBACK_MODEL:
-            # store neutral fallback so DB row has recommendation_sentence
-            return neutral_fallback(f"{type(e1).__name__}: {e1}", expected_ticker), model, f"primary_failed: {type(e1).__name__}: {e1}"
+            return neutral_fallback(f"{type(e1).__name__}: {e1}", expected_ticker), model, f"primary_failed: {type(e1).__name__}: {e1}", {"primary_failed": str(e1)}
 
         try:
-            out = run_llm_once(client, FALLBACK_MODEL, packet)
-            return out, FALLBACK_MODEL, f"primary_failed: {type(e1).__name__}: {e1}"
+            out2, digest2 = run_llm_once(client, FALLBACK_MODEL, packet)
+            return out2, FALLBACK_MODEL, f"primary_failed: {type(e1).__name__}: {e1}", digest2
         except Exception as e2:
             reason = f"primary={type(e1).__name__}: {e1}; fallback={type(e2).__name__}: {e2}"
-            return neutral_fallback(reason, expected_ticker), model, reason
+            return neutral_fallback(reason, expected_ticker), model, reason, {"primary_failed": str(e1), "fallback_failed": str(e2)}
 
 # ============================================================
 # ORCHESTRATION API (what main.py expects)
@@ -546,7 +692,7 @@ def run_once(
     One cycle:
       - load watchlist
       - fetch finance bars (bar_interval + period) + same-day news (optional)
-      - run LLM
+      - run LLM (small JSON schema)
       - upsert result to AI.ai_recommendations
 
     Returns a summary dict for logging.
@@ -604,7 +750,7 @@ def run_once(
                 "news_in_window": news,
             }
 
-            out, used_model, note = run_llm_with_optional_fallback(client, DEFAULT_MODEL, packet)
+            out, used_model, note, prompt_digest = run_llm_with_optional_fallback(client, DEFAULT_MODEL, packet)
 
             row = {
                 "run_date": run_date_val,
@@ -622,12 +768,16 @@ def run_once(
                     "bars_period": BARS_PERIOD,
                     "news_count": len(news or []),
                     "bars_filter_cols": _BARS_FILTER_COLS,
-                    "models": {
+                    "llm": {
+                        "temperature": LLM_TEMPERATURE,
+                        "max_tokens": LLM_MAX_TOKENS,
+                        "timeout_s": LLM_TIMEOUT_S,
+                        "json_mode_requested": FORCE_JSON_MODE,
                         "primary": DEFAULT_MODEL,
                         "fallback": FALLBACK_MODEL if RETRY_ON_BAD_JSON else None,
-                        "json_mode_requested": FORCE_JSON_MODE,
                     },
                     "note": note,
+                    "prompt_digest": prompt_digest,
                 },
                 "error": None,
             }
