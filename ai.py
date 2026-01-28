@@ -709,8 +709,15 @@ def slim_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         "ticker": packet.get("ticker"),
         "company_name": packet.get("company_name"),
         "window_utc": packet.get("day_window_utc"),
+
+        # Global context
+        "global_macro_news_top": packet.get("global_macro_news_top"),
+
+        # Ticker context
         "finance_summary_15m_1d": packet.get("finance_summary_15m_1d"),
         "news_top_3": news_small,
+        "analyst_snapshot": packet.get("analyst_snapshot"),
+        "analyst_events": packet.get("analyst_events"),
     }
 
 # ============================================================
@@ -865,6 +872,54 @@ def run_llm_with_fallback(client: OpenAI, packet: Dict[str, Any]) -> Tuple[Dict[
             reason = f"primary={type(e1).__name__}: {e1}; fallback={type(e2).__name__}: {e2}"
             return neutral_fallback(reason, expected_ticker), DEFAULT_MODEL, reason, {"primary_failed": str(e1), "fallback_failed": str(e2)}
 
+
+# ============================================================
+# ANALYST DATA (NEW)
+# ============================================================
+
+def fetch_analyst_snapshot(ticker: str) -> Optional[Dict[str, Any]]:
+    cnx = mysql_connect(DB_FIN)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("""
+        SELECT *
+        FROM analyst_snapshot
+        WHERE ticker=%s
+        ORDER BY as_of_utc DESC
+        LIMIT 1
+    """, (ticker,))
+    row = cur.fetchone()
+    cur.close()
+    cnx.close()
+    return row
+
+
+def fetch_analyst_events_day(ticker: str, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    cnx = mysql_connect(DB_FIN)
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("""
+        SELECT *
+        FROM analyst_events
+        WHERE ticker=%s
+          AND event_time_utc >= %s
+          AND event_time_utc < %s
+        ORDER BY event_time_utc DESC
+        LIMIT 10
+    """, (ticker, dt_utc_naive(start_utc), dt_utc_naive(end_utc)))
+    rows = cur.fetchall()
+    cur.close()
+    cnx.close()
+    return rows
+
+
+# ============================================================
+# GLOBAL MACRO NEWS (NEW)
+# ============================================================
+
+def fetch_global_macro_news(start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+    # entity_id='macro' in news_llm_analysis
+    return fetch_news_in_window("macro", start_utc, end_utc)
+
+
 # ============================================================
 # MAIN RUN
 # ============================================================
@@ -921,6 +976,13 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
             # News: try name + ticker variants (now pulls LLM artifacts, not full article text)
             matched_news_key, news_rows = fetch_news_any_key(name, ticker, start_utc, end_utc)
 
+            # Global macro LLM results (NEW)
+            macro_news = fetch_global_macro_news(start_utc, end_utc)
+
+            # Analyst data (NEW)
+            analyst_snapshot = fetch_analyst_snapshot(ticker)
+            analyst_events = fetch_analyst_events_day(ticker, start_utc, end_utc)
+
             packet = {
                 "ticker": ticker,
                 "company_name": name,
@@ -928,8 +990,17 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
                     "start": start_utc.isoformat().replace("+00:00", "Z"),
                     "end": end_utc.isoformat().replace("+00:00", "Z"),
                 },
+
+                # Global macro context
+                "global_macro_news_top": macro_news[:3],
+
+                # Ticker context
                 "finance_summary_15m_1d": fin_summary_15m,
                 "news_rows": news_rows,
+
+                # Analyst context
+                "analyst_snapshot": analyst_snapshot,
+                "analyst_events": analyst_events,
             }
 
             out, used_model, note, prompt_digest = run_llm_with_fallback(client, packet)
