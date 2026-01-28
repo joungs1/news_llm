@@ -23,7 +23,8 @@ USE_CHAT_API = False
 # CONFIG
 # ============================================================
 
-THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN")
+THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN") or os.getenv("NEWS_API_TOKEN") or "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e"
+
 OLLAMA_HOST = "http://100.88.217.85:11434"
 OLLAMA_MODEL = "phi3:latest"
 
