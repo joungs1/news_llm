@@ -17,7 +17,7 @@ from openai import OpenAI
 # ============================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "json" / "tickers.json")))
+WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "news_llm" / "json" / "tickers.json")))
 
 # --- Ollama (OpenAI-compatible) ---
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.88.217.85:11434")
