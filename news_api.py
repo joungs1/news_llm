@@ -49,7 +49,7 @@ DEFAULT_CONFIG_CANDIDATES = [p for p in DEFAULT_CONFIG_CANDIDATES if p and str(p
 
 # TheNewsAPI search guardrails
 MAX_ENTITY_KWS = int(os.getenv("NEWS_MAX_ENTITY_KWS", "12"))      # keep searches short & effective
-MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "700")) # TheNewsAPI tends to fail silently on huge queries
+MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "1500")) # TheNewsAPI tends to fail silently on huge queries
 SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()        # IMPORTANT: use "|" (works better than "OR")
 
 # Full-text extraction guardrails
