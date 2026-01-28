@@ -20,7 +20,7 @@ OPENAI_BASE = f"{OLLAMA_HOST}/v1"
 PRIMARY_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "phi3:latest")
 
-MYSQL_HOST = os.getenv("MYSQL_HOST", "100.88.217.85:1143")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
