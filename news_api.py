@@ -6,40 +6,66 @@ import re
 import json
 import time
 import hashlib
-import requests
+import threading
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
-from openai import OpenAI
+import requests
 import mysql.connector
+from openai import OpenAI
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
+THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN", "YOUR_THENEWSAPI_TOKEN")
 if not THENEWSAPI_TOKEN:
-    THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e")
+    THENEWSAPI_TOKEN = os.getenv("NEWS_API_TOKEN", "YOUR_THENEWSAPI_TOKEN")
 
-# MySQL "app login"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "YOUR_MYSQL_PASSWORD")
 MYSQL_DB = os.getenv("MYSQL_DB", "LLM")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "news_llm_analysis")
 
-# repo root heuristic
 ROOT = Path(__file__).resolve().parents[1]
-
-# IMPORTANT: repo has json/news.json (per your git output)
 DEFAULT_CONFIG_CANDIDATES = [
     Path(os.getenv("NEWS_JSON", "")) if os.getenv("NEWS_JSON") else None,
     ROOT / "json" / "news.json",
     ROOT / "news_llm" / "json" / "news.json",
 ]
 DEFAULT_CONFIG_CANDIDATES = [p for p in DEFAULT_CONFIG_CANDIDATES if p and str(p) != ""]
+
+# Dashboard / logging
+DASH_DIR = Path(os.getenv("NEWS_DASH_DIR", str(ROOT / "dashboard_data"))).resolve()
+DASH_PORT = int(os.getenv("NEWS_DASH_PORT", "8011"))
+DASH_RECENT_N = int(os.getenv("NEWS_DASH_RECENT_N", "200"))
+DASH_ENABLE = os.getenv("NEWS_DASH_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
+SAVE_LLM_RAW_TEXT = os.getenv("NEWS_SAVE_LLM_RAW_TEXT", "1").strip().lower() not in {"0", "false", "no"}
+
+# ============================================================
+# GLOBAL STATS (proves both APIs are used)
+# ============================================================
+
+_STATS = {
+    "thenewsapi_requests": 0,
+    "thenewsapi_articles": 0,
+    "llm_calls": 0,
+    "llm_success": 0,
+    "llm_fail": 0,
+    "mysql_rows_attempted": 0,
+    "mysql_rows_inserted": 0,
+    "last_cycle_inserted": 0,
+    "last_cycle_start_utc": None,
+    "last_cycle_end_utc": None,
+}
+
+# in-memory ring buffer for dashboard “recent”
+_RECENT: List[Dict[str, Any]] = []
+_RECENT_LOCK = threading.Lock()
 
 # ============================================================
 # TIME HELPERS
@@ -52,10 +78,6 @@ def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def thenewsapi_dt(dt: datetime) -> str:
-    """
-    TheNewsAPI commonly expects UTC timestamps WITHOUT trailing 'Z' in query params.
-    Example: 2026-01-26T19:00:37  (UTC assumed)
-    """
     dtu = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dtu.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -84,10 +106,6 @@ def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def clamp_str(v: Any, max_len: int) -> Optional[str]:
-    """
-    Safety clamp for VARCHAR columns (prevents MySQL 1406 errors).
-    Returns None if blank/None.
-    """
     if v is None:
         return None
     s = str(v)
@@ -95,8 +113,24 @@ def clamp_str(v: Any, max_len: int) -> Optional[str]:
         return None
     return s[:max_len]
 
+def _clean_keywords(kws: Any) -> List[str]:
+    if not kws or not isinstance(kws, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for k in kws:
+        kk = str(k).strip()
+        if not kk:
+            continue
+        lk = kk.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        out.append(kk)
+    return out
+
 def build_company_search(company_obj: dict) -> str:
-    kws = [k.strip() for k in (company_obj.get("keywords") or []) if k and str(k).strip()]
+    kws = _clean_keywords(company_obj.get("keywords") or [])
     if not kws:
         name = (company_obj.get("display_name") or company_obj.get("id") or "").strip()
         kws = [name] if name else []
@@ -104,55 +138,31 @@ def build_company_search(company_obj: dict) -> str:
     return " | ".join(parts)
 
 def build_ticker_search(ticker: str, name: Optional[str], keywords: Optional[List[str]] = None) -> str:
-    """
-    Uses ticker + name + (optional) keywords from tickers.track[*].keywords.
-
-    We build an OR-heavy query (usually more robust across news providers).
-    We also cap keywords to keep query length sane.
-    """
     t = normalize_ticker(ticker)
     if not t:
         return ""
 
     base = t.split(".")[0] if "." in t else t
-
     terms: List[str] = []
 
-    # Name
     if name:
         nm = name.strip()
         if nm:
             terms.append(f"\"{nm}\"")
 
-    # Ticker & base
     terms.append(f"\"{t}\"")
     if base != t:
         terms.append(f"\"{base}\"")
 
-    # Keywords
-    if keywords:
-        seen = set()
-        cleaned: List[str] = []
-        for k in keywords:
-            kk = str(k).strip()
-            if not kk:
-                continue
-            lk = kk.lower()
-            if lk in seen:
-                continue
-            seen.add(lk)
-            cleaned.append(f"\"{kk}\"" if " " in kk else kk)
-            if len(cleaned) >= 20:  # cap
-                break
-        terms.extend(cleaned)
+    kws = _clean_keywords(keywords or [])
+    if kws:
+        # cap to keep query sane
+        for kk in kws[:20]:
+            terms.append(f"\"{kk}\"" if " " in kk else kk)
 
     return " OR ".join(terms)
 
 def safe_parse_published_at(published_at_val: Any) -> Optional[datetime]:
-    """
-    TheNewsAPI often returns published_at like: 2026-01-26T18:37:13Z or with microseconds.
-    We store DATETIME in MySQL (naive UTC).
-    """
     if not published_at_val:
         return None
     s = str(published_at_val).strip()
@@ -165,6 +175,28 @@ def safe_parse_published_at(published_at_val: Any) -> Optional[datetime]:
         return dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
     except Exception:
         return None
+
+def article_brief(a: dict) -> dict:
+    """What we show in the dashboard as 'sent to LLM'."""
+    return {
+        "uuid": a.get("uuid"),
+        "source": a.get("source"),
+        "published_at": a.get("published_at"),
+        "title": a.get("title"),
+        "url": a.get("url"),
+        "description": a.get("description"),
+        "snippet": a.get("snippet"),
+        "relevance_score": a.get("relevance_score"),
+        "language": a.get("language"),
+        "categories": a.get("categories"),
+        "locale": a.get("locale"),
+    }
+
+def add_recent(entry: Dict[str, Any]) -> None:
+    with _RECENT_LOCK:
+        _RECENT.append(entry)
+        if len(_RECENT) > DASH_RECENT_N:
+            del _RECENT[: len(_RECENT) - DASH_RECENT_N]
 
 # ============================================================
 # CONFIG LOAD
@@ -180,10 +212,7 @@ def load_config() -> dict:
                 return cfg
         except Exception:
             continue
-    raise FileNotFoundError(
-        "Could not find news.json. Tried: "
-        + ", ".join(str(p) for p in DEFAULT_CONFIG_CANDIDATES)
-    )
+    raise FileNotFoundError("Could not find news.json. Tried: " + ", ".join(str(p) for p in DEFAULT_CONFIG_CANDIDATES))
 
 # ============================================================
 # MySQL
@@ -212,20 +241,14 @@ def _column_exists(cur, table: str, col: str) -> bool:
     return len(rows) > 0
 
 def ensure_table():
-    """
-    Creates/migrates table and applies:
-      - url_hash + unique(company,url_hash)
-      - buffered cursors + consuming results
-      - widen market_time_horizon to TEXT to avoid MySQL 1406
-    """
-    # --- Create DB ---
+    # Create DB
     cnx = mysql_connect()
     cur = cnx.cursor(buffered=True)
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
     cur.close()
     cnx.close()
 
-    # --- Create / migrate table ---
+    # Create table
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor(buffered=True)
 
@@ -274,49 +297,38 @@ def ensure_table():
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
 
-    print(f"[ensure_table] connected -> {MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} table={MYSQL_TABLE}")
-
     # Ensure url_hash exists
-    has_url_hash = _column_exists(cur, MYSQL_TABLE, "url_hash")
-    print(f"[ensure_table] column url_hash exists? {has_url_hash}")
-    if not has_url_hash:
+    if not _column_exists(cur, MYSQL_TABLE, "url_hash"):
         cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD COLUMN url_hash VARCHAR(40) NULL AFTER url")
-        print("[ensure_table] added column url_hash")
 
     # Drop old uniq_url if present
-    has_uniq_url = _index_exists(cur, MYSQL_TABLE, "uniq_url")
-    print(f"[ensure_table] index uniq_url exists? {has_uniq_url}")
-    if has_uniq_url:
+    if _index_exists(cur, MYSQL_TABLE, "uniq_url"):
         try:
             cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` DROP INDEX uniq_url")
-            print("[ensure_table] dropped index uniq_url")
-        except Exception as e:
-            print(f"[ensure_table] WARNING: failed to drop uniq_url: {type(e).__name__}: {e}")
+        except Exception:
+            pass
 
-    # Add new unique index on (company, url_hash)
-    has_new_uniq = _index_exists(cur, MYSQL_TABLE, "uniq_company_urlhash")
-    print(f"[ensure_table] index uniq_company_urlhash exists? {has_new_uniq}")
-    if not has_new_uniq:
+    # Add unique index on (company, url_hash)
+    if not _index_exists(cur, MYSQL_TABLE, "uniq_company_urlhash"):
         try:
             cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_company_urlhash (company(191), url_hash)")
-            print("[ensure_table] added index uniq_company_urlhash (company(191), url_hash)")
-        except Exception as e:
-            print(f"[ensure_table] WARNING: failed to add uniq_company_urlhash: {type(e).__name__}: {e}")
+        except Exception:
+            pass
 
-    # Widen market_time_horizon to TEXT (avoids 1406)
+    # Widen market_time_horizon to TEXT (fix MySQL 1406)
     try:
         cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` MODIFY COLUMN market_time_horizon TEXT NULL")
-        print("[ensure_table] widened market_time_horizon -> TEXT")
-    except Exception as e:
-        print(f"[ensure_table] NOTE: could not modify market_time_horizon: {type(e).__name__}: {e}")
+    except Exception:
+        pass
 
     cur.close()
     cnx.close()
-    print("[ensure_table] done")
 
-def insert_rows(rows: List[Dict[str, Any]]) -> None:
+def insert_rows(rows: List[Dict[str, Any]]) -> int:
+    """Returns rows attempted (not necessarily inserted if duplicates)."""
     if not rows:
-        return
+        return 0
+
     cnx = mysql_connect(MYSQL_DB)
     cur = cnx.cursor(buffered=True)
 
@@ -403,6 +415,7 @@ def insert_rows(rows: List[Dict[str, Any]]) -> None:
     cur.executemany(sql, vals)
     cur.close()
     cnx.close()
+    return len(rows)
 
 # ============================================================
 # TheNewsAPI
@@ -424,12 +437,6 @@ def _resolve_domains(cfg: dict) -> Tuple[List[str], List[str]]:
     dom = api_cfg.get("domains") or {}
     inc = dom.get("include") or []
     exc = dom.get("exclude") or []
-
-    src = cfg.get("sources") or {}
-    if (src.get("mode") or "").strip().lower() == "domains":
-        inc = src.get("include") or inc
-        exc = src.get("exclude") or exc
-
     return list(inc), list(exc)
 
 def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) -> List[Dict[str, Any]]:
@@ -471,12 +478,16 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
 
     out: List[Dict[str, Any]] = []
     while True:
+        _STATS["thenewsapi_requests"] += 1
         r = requests.get(base, params=params, timeout=30)
         if r.status_code >= 400:
             raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:800]}", response=r)
+
         data = r.json() or {}
         items = data.get("data") or []
-        out.extend(items if isinstance(items, list) else [])
+        if isinstance(items, list):
+            _STATS["thenewsapi_articles"] += len(items)
+            out.extend(items)
 
         meta = data.get("meta") or {}
         next_page = meta.get("next_page")
@@ -552,8 +563,10 @@ def build_prompt(article: dict) -> str:
         f"Article:\n{json.dumps(article, ensure_ascii=False)}"
     )
 
-def analyze_article(client: OpenAI, model: str, article: dict) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def analyze_article(client: OpenAI, model: str, article: dict) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    _STATS["llm_calls"] += 1
     t0 = time.time()
+
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": build_prompt(article)}],
@@ -562,8 +575,10 @@ def analyze_article(client: OpenAI, model: str, article: dict) -> Tuple[Dict[str
         stream=False,
     )
     elapsed = time.time() - t0
-    text = (resp.choices[0].message.content or "").strip()
-    parsed = extract_json_object(text)
+    raw_text = (resp.choices[0].message.content or "").strip()
+
+    parsed = extract_json_object(raw_text)
+    _STATS["llm_success"] += 1
 
     usage = getattr(resp, "usage", None)
     perf = {
@@ -572,7 +587,199 @@ def analyze_article(client: OpenAI, model: str, article: dict) -> Tuple[Dict[str
         "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
         "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
     }
-    return parsed, perf
+    return parsed, perf, raw_text
+
+# ============================================================
+# DASHBOARD (writes static files + serves them)
+# ============================================================
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>News LLM Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; background:#fff; }
+    .kpi { min-width: 240px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+    .small { font-size: 12px; color: #444; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
+    th { text-align:left; background:#fafafa; position: sticky; top: 0; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; margin-right:6px; }
+    details { border:1px solid #eee; border-radius:10px; padding:8px; background:#fcfcfc; }
+    summary { cursor:pointer; }
+    a { color: #0b57d0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .muted { color:#666; }
+  </style>
+</head>
+<body>
+  <h2>News → LLM → MySQL</h2>
+  <div class="row">
+    <div class="card kpi">
+      <div><b>Cycle</b>: <span id="cycle">-</span></div>
+      <div class="small">Last window: <span id="window">-</span></div>
+    </div>
+    <div class="card kpi">
+      <div><b>TheNewsAPI</b></div>
+      <div>Requests: <span id="t_req">-</span></div>
+      <div>Articles: <span id="t_art">-</span></div>
+    </div>
+    <div class="card kpi">
+      <div><b>LLM</b></div>
+      <div>Calls: <span id="l_calls">-</span></div>
+      <div>Success: <span id="l_ok">-</span></div>
+      <div>Fail: <span id="l_fail">-</span></div>
+    </div>
+    <div class="card kpi">
+      <div><b>MySQL</b></div>
+      <div>Attempted rows: <span id="m_try">-</span></div>
+      <div>Last cycle attempted: <span id="m_last">-</span></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:18px;">Recent: what was sent to the LLM + response</h3>
+  <div class="small muted">Auto-refresh every 5 seconds. Showing latest rows first.</div>
+  <div id="recent"></div>
+
+<script>
+async function loadJSON(path){
+  const r = await fetch(path + "?_=" + Date.now());
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  return await r.json();
+}
+
+function esc(s){
+  if(s === null || s === undefined) return "";
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+
+function renderRecent(items){
+  const root = document.getElementById("recent");
+  if(!items || items.length === 0){
+    root.innerHTML = "<div class='card'>No recent items yet.</div>";
+    return;
+  }
+  let html = "<table><thead><tr>" +
+    "<th>When</th><th>Company/Ticker</th><th>Article</th><th>LLM Output</th></tr></thead><tbody>";
+
+  for(const it of items){
+    const when = esc(it.ts_utc || "");
+    const company = esc(it.company || "");
+    const title = esc((it.article||{}).title || "");
+    const url = esc((it.article||{}).url || "");
+    const source = esc((it.article||{}).source || "");
+    const pub = esc((it.article||{}).published_at || "");
+    const snippet = esc((it.article||{}).snippet || (it.article||{}).description || "");
+
+    const sentiment = esc((it.parsed||{}).sentiment || "");
+    const conf = esc((it.parsed||{}).confidence_0_to_100 || "");
+    const one = esc((it.parsed||{}).one_sentence_summary || "");
+    const mi = (it.parsed||{}).market_impact || {};
+    const dir = esc(mi.direction || "");
+    const hor = esc(mi.time_horizon || "");
+    const rat = esc(mi.rationale || "");
+
+    html += "<tr>";
+    html += "<td class='small'>" + when + "</td>";
+    html += "<td><span class='pill'>" + company + "</span></td>";
+    html += "<td>" +
+      "<div><b>" + (url ? "<a target='_blank' href='" + url + "'>" + title + "</a>" : title) + "</b></div>" +
+      "<div class='small muted'>source=" + source + " • published=" + pub + "</div>" +
+      (snippet ? "<div class='small'>" + snippet + "</div>" : "") +
+      "</td>";
+
+    html += "<td>" +
+      "<div class='small'><span class='pill'>sentiment=" + sentiment + "</span>" +
+      "<span class='pill'>conf=" + conf + "</span>" +
+      "<span class='pill'>dir=" + dir + "</span>" +
+      "<span class='pill'>horizon=" + hor + "</span></div>" +
+      (one ? "<div><b>Summary:</b> " + one + "</div>" : "") +
+      (rat ? "<div class='small'><b>Rationale:</b> " + rat + "</div>" : "") +
+      "<details style='margin-top:6px;'><summary class='mono'>Raw JSON (parsed)</summary>" +
+      "<pre class='mono'>" + esc(JSON.stringify(it.parsed || {}, null, 2)) + "</pre></details>" +
+      (it.raw_text ? "<details><summary class='mono'>Raw LLM text</summary><pre class='mono'>" + esc(it.raw_text) + "</pre></details>" : "") +
+      "</td>";
+
+    html += "</tr>";
+  }
+  html += "</tbody></table>";
+  root.innerHTML = html;
+}
+
+async function refresh(){
+  try{
+    const s = await loadJSON("stats.json");
+    document.getElementById("cycle").textContent = s.cycle ?? "-";
+    document.getElementById("window").textContent = (s.last_cycle_start_utc || "-") + " → " + (s.last_cycle_end_utc || "-");
+    document.getElementById("t_req").textContent = s.thenewsapi_requests ?? "-";
+    document.getElementById("t_art").textContent = s.thenewsapi_articles ?? "-";
+    document.getElementById("l_calls").textContent = s.llm_calls ?? "-";
+    document.getElementById("l_ok").textContent = s.llm_success ?? "-";
+    document.getElementById("l_fail").textContent = s.llm_fail ?? "-";
+    document.getElementById("m_try").textContent = s.mysql_rows_attempted ?? "-";
+    document.getElementById("m_last").textContent = s.last_cycle_inserted ?? "-";
+  }catch(e){}
+
+  try{
+    const r = await loadJSON("recent.json");
+    renderRecent(r.items || []);
+  }catch(e){}
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+def dash_write_files(state: dict) -> None:
+    if not DASH_ENABLE:
+        return
+
+    DASH_DIR.mkdir(parents=True, exist_ok=True)
+
+    # stats.json
+    stats_payload = dict(_STATS)
+    stats_payload["cycle"] = state.get("cycle")
+    with open(DASH_DIR / "stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats_payload, f, ensure_ascii=False, indent=2)
+
+    # recent.json
+    with _RECENT_LOCK:
+        items = list(reversed(_RECENT))  # newest first
+    with open(DASH_DIR / "recent.json", "w", encoding="utf-8") as f:
+        json.dump({"items": items}, f, ensure_ascii=False)
+
+    # dashboard.html (write once if missing)
+    html_path = DASH_DIR / "dashboard.html"
+    if not html_path.exists():
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(DASHBOARD_HTML)
+
+def dash_serve_forever() -> None:
+    if not DASH_ENABLE:
+        return
+
+    DASH_DIR.mkdir(parents=True, exist_ok=True)
+    html_path = DASH_DIR / "dashboard.html"
+    if not html_path.exists():
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(DASHBOARD_HTML)
+
+    class Handler(SimpleHTTPRequestHandler):
+        # Serve from DASH_DIR
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(DASH_DIR), **kwargs)
+
+    httpd = ThreadingHTTPServer(("0.0.0.0", DASH_PORT), Handler)
+    print(f"[dashboard] serving {DASH_DIR} on http://0.0.0.0:{DASH_PORT}/dashboard.html")
+    httpd.serve_forever()
 
 # ============================================================
 # RUNTIME
@@ -594,6 +801,25 @@ def pick_model(models: List[str], preferred: str, fallback_index: int) -> str:
         return models[fallback_index]
     return models[0]
 
+def _print_loaded_keywords(companies: List[dict], tickers: List[Dict[str, Any]]) -> None:
+    print("\n[keywords_loaded] companies:")
+    for c in companies:
+        name = (c.get("display_name") or c.get("id") or "UNKNOWN").strip()
+        kws = _clean_keywords(c.get("keywords") or [])
+        preview = ", ".join(kws[:12])
+        suffix = " ..." if len(kws) > 12 else ""
+        print(f"  - {name}: {len(kws)} keywords -> {preview}{suffix}")
+
+    print("\n[keywords_loaded] tickers:")
+    for t in tickers:
+        sym = t.get("ticker") or ""
+        nm = t.get("name") or sym
+        kws = _clean_keywords(t.get("keywords") or [])
+        preview = ", ".join(kws[:10])
+        suffix = " ..." if len(kws) > 10 else ""
+        print(f"  - {sym} ({nm}): {len(kws)} keywords -> {preview}{suffix}")
+    print("")
+
 def build_runtime(cfg: dict) -> dict:
     polling = cfg.get("polling", {}) or {}
     lookback_minutes = int(polling.get("lookback_minutes", 30))
@@ -608,7 +834,6 @@ def build_runtime(cfg: dict) -> dict:
 
     companies = (cfg.get("query") or {}).get("companies") or []
 
-    # ---- TICKERS (NOW INCLUDES KEYWORDS) ----
     tickers_cfg = cfg.get("tickers") or {}
     tickers_mode = (tickers_cfg.get("mode") or "").strip().lower()
     tickers_track = tickers_cfg.get("track") or []
@@ -621,7 +846,7 @@ def build_runtime(cfg: dict) -> dict:
             if not sym:
                 continue
             nm = strip_or_none(t.get("name")) or sym
-            kws = [str(k).strip() for k in (t.get("keywords") or []) if str(k).strip()]
+            kws = _clean_keywords(t.get("keywords") or [])
             tickers.append({"ticker": sym, "name": nm, "keywords": kws})
 
     if not companies and not tickers:
@@ -633,16 +858,28 @@ def build_runtime(cfg: dict) -> dict:
     chosen_model = pick_model(models, preferred_model, fallback_idx)
     client = OpenAI(base_url=f"{ollama_host}/v1", api_key="ollama")
 
-    return {
+    _print_loaded_keywords(companies, tickers)
+
+    state = {
         "cfg": cfg,
         "client": client,
         "model": chosen_model,
         "companies": companies,
         "tickers": tickers,
-        "seen": set(),  # key is (company, url_hash)
+        "seen": set(),  # (company, url_hash)
         "last_poll": utc_now() - timedelta(minutes=lookback_minutes),
         "cycle": 0,
     }
+
+    # Start dashboard server once
+    if DASH_ENABLE:
+        t = threading.Thread(target=dash_serve_forever, daemon=True)
+        t.start()
+
+        # write initial files
+        dash_write_files(state)
+
+    return state
 
 _STATE: Optional[dict] = None
 
@@ -660,21 +897,26 @@ def run_once() -> Tuple[int, datetime]:
         print(f"[news_api] loaded_config={_STATE['cfg'].get('_loaded_from')}")
         print(f"[news_api] tickers_loaded={len(_STATE['tickers'])} companies_loaded={len(_STATE['companies'])}")
         print(f"[news_api] model={_STATE['model']}")
+        if DASH_ENABLE:
+            print(f"[news_api] dashboard_url=http://localhost:{DASH_PORT}/dashboard.html")
 
     _STATE["cycle"] += 1
     cfg = _STATE["cfg"]
     client: OpenAI = _STATE["client"]
     model: str = _STATE["model"]
-
     companies = _STATE["companies"]
     tickers = _STATE["tickers"]
     seen = _STATE["seen"]
     last_poll = _STATE["last_poll"]
 
     poll_end = utc_now()
+    cycle_start = last_poll
+    _STATS["last_cycle_start_utc"] = iso_z(cycle_start)
+    _STATS["last_cycle_end_utc"] = iso_z(poll_end)
+
     batch: List[Dict[str, Any]] = []
 
-    # A) Macro/company queries
+    # A) Companies (macro)
     for c in companies:
         company_name = (c.get("display_name") or c.get("id") or "UNKNOWN").strip()
         search = build_company_search(c)
@@ -682,6 +924,7 @@ def run_once() -> Tuple[int, datetime]:
             continue
 
         articles = fetch_thenewsapi(cfg, search, last_poll, poll_end)
+
         for a in articles:
             url = (a.get("url") or "").strip()
             if not url:
@@ -693,15 +936,32 @@ def run_once() -> Tuple[int, datetime]:
                 continue
             seen.add(seen_key)
 
+            # --- Dashboard: show what is being sent to LLM
+            sent_ts = iso_z(utc_now())
+            add_recent({
+                "ts_utc": sent_ts,
+                "company": company_name,
+                "stage": "sent_to_llm",
+                "article": article_brief(a),
+            })
+
             try:
-                analysis, perf = analyze_article(client, model, a)
+                analysis, perf, raw_text = analyze_article(client, model, a)
                 mi = (analysis.get("market_impact") or {})
+
+                add_recent({
+                    "ts_utc": iso_z(utc_now()),
+                    "company": company_name,
+                    "stage": "llm_response",
+                    "article": article_brief(a),
+                    "parsed": analysis,
+                    "raw_text": raw_text if SAVE_LLM_RAW_TEXT else None,
+                })
 
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
                     "company": company_name,
-
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
                     "published_at": safe_parse_published_at(a.get("published_at")),
@@ -711,30 +971,32 @@ def run_once() -> Tuple[int, datetime]:
                     "description": a.get("description"),
                     "snippet": a.get("snippet"),
                     "image_url": a.get("image_url"),
-
                     "language": a.get("language"),
                     "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
-
                     "sentiment": clamp_str(analysis.get("sentiment"), 16),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
-
                     "market_direction": clamp_str(mi.get("direction"), 16),
-                    # TEXT in DB, but clamp anyway (prevents insane outputs)
                     "market_time_horizon": clamp_str(mi.get("time_horizon"), 500),
                     "market_rationale": mi.get("rationale"),
-
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
                     "completion_tokens": perf.get("completion_tokens"),
                     "total_tokens": perf.get("total_tokens"),
-
                     "analysis_json": json.dumps(analysis, ensure_ascii=False),
                     "error": None,
                 })
             except Exception as e:
+                _STATS["llm_fail"] += 1
+                add_recent({
+                    "ts_utc": iso_z(utc_now()),
+                    "company": company_name,
+                    "stage": "llm_error",
+                    "article": article_brief(a),
+                    "error": f"{type(e).__name__}: {e}",
+                })
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
@@ -748,7 +1010,7 @@ def run_once() -> Tuple[int, datetime]:
                     "error": f"analysis_error: {type(e).__name__}: {e}",
                 })
 
-    # B) Ticker queries (company=ticker)
+    # B) Tickers
     for t in tickers:
         ticker = normalize_ticker(t.get("ticker"))
         name = strip_or_none(t.get("name")) or ticker
@@ -756,12 +1018,12 @@ def run_once() -> Tuple[int, datetime]:
         if not ticker:
             continue
 
-        # ---- NOW USES KEYWORDS ----
         search = build_ticker_search(ticker, name, keywords)
         if not search:
             continue
 
         articles = fetch_thenewsapi(cfg, search, last_poll, poll_end)
+
         for a in articles:
             url = (a.get("url") or "").strip()
             if not url:
@@ -773,15 +1035,30 @@ def run_once() -> Tuple[int, datetime]:
                 continue
             seen.add(seen_key)
 
+            add_recent({
+                "ts_utc": iso_z(utc_now()),
+                "company": ticker,
+                "stage": "sent_to_llm",
+                "article": article_brief(a),
+            })
+
             try:
-                analysis, perf = analyze_article(client, model, a)
+                analysis, perf, raw_text = analyze_article(client, model, a)
                 mi = (analysis.get("market_impact") or {})
+
+                add_recent({
+                    "ts_utc": iso_z(utc_now()),
+                    "company": ticker,
+                    "stage": "llm_response",
+                    "article": article_brief(a),
+                    "parsed": analysis,
+                    "raw_text": raw_text if SAVE_LLM_RAW_TEXT else None,
+                })
 
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
                     "company": ticker,
-
                     "uuid": a.get("uuid"),
                     "source": a.get("source"),
                     "published_at": safe_parse_published_at(a.get("published_at")),
@@ -791,29 +1068,32 @@ def run_once() -> Tuple[int, datetime]:
                     "description": a.get("description"),
                     "snippet": a.get("snippet"),
                     "image_url": a.get("image_url"),
-
                     "language": a.get("language"),
                     "categories": json.dumps(a.get("categories"), ensure_ascii=False) if a.get("categories") is not None else None,
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
-
                     "sentiment": clamp_str(analysis.get("sentiment"), 16),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
-
                     "market_direction": clamp_str(mi.get("direction"), 16),
                     "market_time_horizon": clamp_str(mi.get("time_horizon"), 500),
                     "market_rationale": mi.get("rationale"),
-
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
                     "completion_tokens": perf.get("completion_tokens"),
                     "total_tokens": perf.get("total_tokens"),
-
                     "analysis_json": json.dumps(analysis, ensure_ascii=False),
                     "error": None,
                 })
             except Exception as e:
+                _STATS["llm_fail"] += 1
+                add_recent({
+                    "ts_utc": iso_z(utc_now()),
+                    "company": ticker,
+                    "stage": "llm_error",
+                    "article": article_brief(a),
+                    "error": f"{type(e).__name__}: {e}",
+                })
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
@@ -827,11 +1107,29 @@ def run_once() -> Tuple[int, datetime]:
                     "error": f"analysis_error(ticker): {type(e).__name__}: {e}",
                 })
 
+    _STATS["mysql_rows_attempted"] += len(batch)
+    _STATS["last_cycle_inserted"] = len(batch)
+
     if batch:
-        insert_rows(batch)
+        inserted = insert_rows(batch)
+        _STATS["mysql_rows_inserted"] += inserted
+    else:
+        inserted = 0
 
     _STATE["last_poll"] = poll_end
-    return len(batch), poll_end
+
+    # Write dashboard files each cycle
+    dash_write_files(_STATE)
+
+    # Print proof both APIs are used
+    print(
+        f"[stats] thenewsapi_requests={_STATS['thenewsapi_requests']} "
+        f"thenewsapi_articles={_STATS['thenewsapi_articles']} "
+        f"llm_calls={_STATS['llm_calls']} llm_success={_STATS['llm_success']} "
+        f"llm_fail={_STATS['llm_fail']} mysql_rows_attempted={_STATS['mysql_rows_attempted']}"
+    )
+
+    return inserted, poll_end
 
 def run_forever():
     cfg = load_config()
@@ -843,6 +1141,8 @@ def run_forever():
     print(f"[news_api] loaded_config={_STATE['cfg'].get('_loaded_from')}")
     print(f"[news_api] tickers_loaded={len(_STATE['tickers'])} companies_loaded={len(_STATE['companies'])}")
     print(f"[news_api] model={_STATE['model']}")
+    if DASH_ENABLE:
+        print(f"[news_api] dashboard_url=http://localhost:{DASH_PORT}/dashboard.html")
 
     while True:
         inserted, poll_end = run_once()
