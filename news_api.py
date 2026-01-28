@@ -49,13 +49,15 @@ DEFAULT_CONFIG_CANDIDATES = [p for p in DEFAULT_CONFIG_CANDIDATES if p and str(p
 
 # TheNewsAPI search guardrails
 MAX_ENTITY_KWS = int(os.getenv("NEWS_MAX_ENTITY_KWS", "12"))      # keep searches short & effective
-MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "1500")) # TheNewsAPI tends to fail silently on huge queries
+MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "700")) # TheNewsAPI tends to fail silently on huge queries
 SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()        # IMPORTANT: use "|" (works better than "OR")
 
 # Full-text extraction guardrails
 FULLTEXT_ENABLE = os.getenv("NEWS_FULLTEXT_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
-FULLTEXT_TIMEOUT_S = int(os.getenv("NEWS_FULLTEXT_TIMEOUT_S", "30"))
+FULLTEXT_TIMEOUT_S = int(os.getenv("NEWS_FULLTEXT_TIMEOUT_S", "20"))
 FULLTEXT_MAX_CHARS = int(os.getenv("NEWS_FULLTEXT_MAX_CHARS", "18000"))
+LLM_INPUT_MAX_CHARS = int(os.getenv("NEWS_LLM_INPUT_MAX_CHARS", "2400"))
+BAD_OUTPUT_MAX_CHARS = int(os.getenv("NEWS_BAD_OUTPUT_MAX_CHARS", "1200"))
 HTTP_UA = os.getenv(
     "NEWS_HTTP_USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -521,7 +523,7 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     while True:
         r = requests.get(base, params=params, timeout=30)
         if r.status_code >= 400:
-            raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:1250]}", response=r)
+            raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:800]}", response=r)
 
         data = r.json() or {}
         items = data.get("data") or []
@@ -683,11 +685,14 @@ def build_llm_input_text(article: dict, full_text: Optional[str]) -> str:
     parts.append(f"METADATA:\n{json.dumps(meta, ensure_ascii=False)}")
 
     text = "\n\n".join(parts).strip()
-    if len(text) > (FULLTEXT_MAX_CHARS + 2500):
-        text = text[:FULLTEXT_MAX_CHARS + 2500].rstrip() + "\n\n[TRUNCATED_LLM_INPUT]"
+    if len(text) > LLM_INPUT_MAX_CHARS:
+        text = text[:LLM_INPUT_MAX_CHARS].rstrip() + "\n\n[TRUNCATED_LLM_INPUT]"
     return text
 
 def build_prompt(entity_name: str, llm_input_text: str) -> str:
+    llm_input_text = (llm_input_text or "")
+    if len(llm_input_text) > LLM_INPUT_MAX_CHARS:
+        llm_input_text = llm_input_text[:LLM_INPUT_MAX_CHARS].rstrip() + "\n\n[TRUNCATED_LLM_INPUT]"
     schema = {
         "sentiment": "positive|neutral|negative",
         "confidence_0_to_100": 0,
@@ -710,6 +715,11 @@ def build_prompt(entity_name: str, llm_input_text: str) -> str:
 
 def build_repair_prompt(entity_name: str, llm_input_text: str, bad_output: str) -> str:
     """Second-pass prompt to coerce strict JSON when the first pass wasn't valid JSON."""
+    bad_output = (bad_output or "")
+    if len(bad_output) > BAD_OUTPUT_MAX_CHARS:
+        bad_output = bad_output[:BAD_OUTPUT_MAX_CHARS].rstrip() + "\n[TRUNCATED_BAD_OUTPUT]"
+    if len(llm_input_text or "") > LLM_INPUT_MAX_CHARS:
+        llm_input_text = (llm_input_text or "")[:LLM_INPUT_MAX_CHARS].rstrip() + "\n\n[TRUNCATED_LLM_INPUT]"
     schema = {
         "sentiment": "positive|neutral|negative",
         "confidence_0_to_100": 0,
