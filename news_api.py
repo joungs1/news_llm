@@ -22,7 +22,7 @@ from openai import OpenAI
 
 THENEWSAPI_TOKEN = os.getenv("THENEWSAPI_TOKEN") or os.getenv("NEWS_API_TOKEN") or "GLW7gjLDEnhMk0iA2bOLz5ZrFwANg1ZXlunXaR2e"
 
-MYSQL_HOST = os.getenv("MYSQL_HOST", "1100.117.198.80")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "100.117.198.80")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
