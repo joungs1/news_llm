@@ -15,7 +15,7 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.88.217.85:11434")
 OPENAI_BASE = f"{OLLAMA_HOST}/v1"
 PRIMARY_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "phi3:latest")
@@ -23,7 +23,7 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "phi3:latest")
 MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "admin")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "B612b612@")
 DB_FIN = "Finance"
 DB_NEWS = "LLM"
 DB_AI = "AI"
