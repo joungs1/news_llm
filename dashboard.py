@@ -105,6 +105,31 @@ def parse_yyyy_mm_dd(s: Optional[str]) -> date_cls:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
+
+def _news_key_variants(key: str) -> List[str]:
+    """Generate tolerant match variants for news keys (e.g., TD.TO <-> td-to)."""
+    k = (key or "").strip()
+    if not k:
+        return []
+    out = {k}
+
+    out.add(k.upper())
+    out.add(k.lower())
+
+    # dot/dash swap (TD.TO <-> td-to)
+    out.add(k.replace(".", "-"))
+    out.add(k.replace(".", "-").upper())
+    out.add(k.replace(".", "-").lower())
+
+    out.add(k.replace("-", "."))
+    out.add(k.replace("-", ".").upper())
+    out.add(k.replace("-", ".").lower())
+
+    # strip extra whitespace
+    out = {x.strip() for x in out if x and x.strip()}
+    return sorted(out)
+
+
 def day_window(d: date_cls) -> Tuple[datetime, datetime]:
     start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
@@ -314,57 +339,88 @@ def fetch_news_block(
     entity_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    key:
-      - OLD schema: company key (ticker or display string) stored in `company`
-      - NEW schema: entity_id (ticker like 'SU.TO' or id like 'macro') OR display_name
+    News lookup that is tolerant to mixed schemas + mixed key formats.
+
+    Matches the provided key against ANY available identifier columns:
+      - company (old schema)
+      - entity_id, display_name (new schema)
+      - ticker (optional column in your current table)
+
+    Also normalizes common ticker formats (e.g., TD.TO <-> td-to) so the UI can
+    query by ticker while DB stored entity_id uses dashed form.
 
     entity_type:
-      - optional filter for NEW schema ('ticker' or 'company')
-      - Some of your rows have entity_type NULL; we treat NULL/'' as compatible.
+      - If provided and column exists, we *prefer* entity_type match but do NOT
+        exclude rows where entity_type is NULL/'' (older inserts).
     """
     start_utc, end_utc = day_window(d)
 
     has_company = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "company")
     has_entity_id = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "entity_id")
     has_display_name = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "display_name")
+    has_ticker = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "ticker")
     has_entity_type = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "entity_type")
+    has_conf0 = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "confidence_0_to_100")
+    has_conf = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "confidence")
 
-    # If the table has BOTH old + new columns, we must NOT "lock" onto company=%s,
-    # because many new-schema rows keep company NULL (as in your screenshot).
-    # So: match on ANY available identifier column.
+    variants = _news_key_variants(key)
+    if not variants:
+        return []
+
+    def _in_clause(col: str, n: int) -> str:
+        return f"{col} IN (" + ",".join(["%s"] * n) + ")"
+
     key_parts: List[str] = []
     key_params: List[Any] = []
 
     if has_company:
-        key_parts.append("company=%s")
-        key_params.append(key)
+        key_parts.append(_in_clause("company", len(variants)))
+        key_params.extend(variants)
+
     if has_entity_id:
-        key_parts.append("entity_id=%s")
-        key_params.append(key)
+        key_parts.append(_in_clause("entity_id", len(variants)))
+        key_params.extend(variants)
+
     if has_display_name:
-        key_parts.append("display_name=%s")
-        key_params.append(key)
+        key_parts.append(_in_clause("display_name", len(variants)))
+        key_params.extend(variants)
+
+    if has_ticker:
+        key_parts.append(_in_clause("ticker", len(variants)))
+        key_params.extend(variants)
 
     if not key_parts:
         return []
+
+    # Confidence column varies across versions; normalize to confidence_0_to_100 and avoid NaN in UI.
+    if has_conf0 and has_conf:
+        conf_expr = "COALESCE(confidence_0_to_100, confidence, 0) AS confidence_0_to_100"
+    elif has_conf0:
+        conf_expr = "COALESCE(confidence_0_to_100, 0) AS confidence_0_to_100"
+    elif has_conf:
+        conf_expr = "COALESCE(confidence, 0) AS confidence_0_to_100"
+    else:
+        conf_expr = "0 AS confidence_0_to_100"
 
     cnx = mysql_connect(MYSQL_DB_NEWS)
     cur = cnx.cursor(dictionary=True)
 
     select_sql = f"""
         SELECT timestamp_utc, published_at, source, title, url,
-               one_sentence_summary, sentiment, confidence_0_to_100
+               one_sentence_summary, sentiment,
+               {conf_expr},
+               error
         FROM `{MYSQL_TABLE_NEWS}`
     """
 
     where_parts: List[str] = [
         "(" + " OR ".join(key_parts) + ")",
         "timestamp_utc >= %s AND timestamp_utc < %s",
-        "(error IS NULL OR error = '')",
+        "(title IS NOT NULL AND title <> '')",
     ]
     params: List[Any] = key_params + [dt_utc_naive(start_utc), dt_utc_naive(end_utc)]
 
-    # entity_type filter, but allow NULL/'' rows (your data currently has entity_type NULL)
+    # If entity_type is requested, don't exclude NULL/'' rows (your global/ticker rows may have NULL entity_type).
     if entity_type and has_entity_type:
         where_parts.insert(0, "(entity_type=%s OR entity_type IS NULL OR entity_type='')")
         params.insert(0, entity_type)
@@ -383,12 +439,10 @@ def fetch_news_block(
     return safe_json(rows)
 
 
+
+
 def fetch_global_news_block(d: date_cls) -> Dict[str, Any]:
-    # Global rows sometimes have entity_type NULL, so we do not hard-require entity_type='company'
-    items = fetch_news_block(GLOBAL_NEWS_COMPANY, d, limit=GLOBAL_NEWS_LIMIT, entity_type=None)
-    # Also try a fallback key if user configured GLOBAL_NEWS_COMPANY as display name but rows store 'macro', or vice versa.
-    if not items and GLOBAL_NEWS_COMPANY != "macro":
-        items = fetch_news_block("macro", d, limit=GLOBAL_NEWS_LIMIT, entity_type=None)
+    items = fetch_news_block(GLOBAL_NEWS_COMPANY, d, limit=GLOBAL_NEWS_LIMIT, entity_type="company")
     return {"company": GLOBAL_NEWS_COMPANY, "date": str(d), "items": items}
 
 
