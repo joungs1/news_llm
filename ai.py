@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WATCHLIST_JSON = Path(os.getenv("WATCHLIST_JSON", str(REPO_ROOT / "news_llm" / "json" / "tickers.json")))
 
 # --- Ollama (OpenAI-compatible) ---
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.88.217.85:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://100.72.98.127:11434")
 OPENAI_BASE = f"{OLLAMA_HOST}/v1"
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "phi3:latest")  # optional
