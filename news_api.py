@@ -53,7 +53,6 @@ def iso_z(dt: datetime) -> str:
 
 def thenewsapi_dt(dt: datetime) -> str:
     """
-    FIX #1 (400 Bad Request):
     TheNewsAPI commonly expects UTC timestamps WITHOUT trailing 'Z' in query params.
     Example: 2026-01-26T19:00:37  (UTC assumed)
     """
@@ -84,28 +83,17 @@ def normalize_ticker(raw: Any) -> str:
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
-def build_ticker_search(ticker: str, name: Optional[str]) -> str:
+def clamp_str(v: Any, max_len: int) -> Optional[str]:
     """
-    Note: TheNewsAPI supports boolean-ish search, but syntax can be finicky.
-    Keep your original intent: include name + ticker + base ticker.
-    Use OR terms; avoid insane length.
+    Safety clamp for VARCHAR columns (prevents MySQL 1406 errors).
+    Returns None if blank/None.
     """
-    t = normalize_ticker(ticker)
-    if not t:
-        return ""
-    base = t.split(".")[0] if "." in t else t
-
-    terms: List[str] = []
-    if name:
-        nm = name.strip()
-        if nm:
-            terms.append(f"\"{nm}\"")
-
-    terms.append(f"\"{t}\"")
-    if base != t:
-        terms.append(f"\"{base}\"")
-
-    return " OR ".join(terms)
+    if v is None:
+        return None
+    s = str(v)
+    if not s.strip():
+        return None
+    return s[:max_len]
 
 def build_company_search(company_obj: dict) -> str:
     kws = [k.strip() for k in (company_obj.get("keywords") or []) if k and str(k).strip()]
@@ -114,6 +102,51 @@ def build_company_search(company_obj: dict) -> str:
         kws = [name] if name else []
     parts = [f"\"{k}\"" if " " in k else k for k in kws]
     return " | ".join(parts)
+
+def build_ticker_search(ticker: str, name: Optional[str], keywords: Optional[List[str]] = None) -> str:
+    """
+    Uses ticker + name + (optional) keywords from tickers.track[*].keywords.
+
+    We build an OR-heavy query (usually more robust across news providers).
+    We also cap keywords to keep query length sane.
+    """
+    t = normalize_ticker(ticker)
+    if not t:
+        return ""
+
+    base = t.split(".")[0] if "." in t else t
+
+    terms: List[str] = []
+
+    # Name
+    if name:
+        nm = name.strip()
+        if nm:
+            terms.append(f"\"{nm}\"")
+
+    # Ticker & base
+    terms.append(f"\"{t}\"")
+    if base != t:
+        terms.append(f"\"{base}\"")
+
+    # Keywords
+    if keywords:
+        seen = set()
+        cleaned: List[str] = []
+        for k in keywords:
+            kk = str(k).strip()
+            if not kk:
+                continue
+            lk = kk.lower()
+            if lk in seen:
+                continue
+            seen.add(lk)
+            cleaned.append(f"\"{kk}\"" if " " in kk else kk)
+            if len(cleaned) >= 20:  # cap
+                break
+        terms.extend(cleaned)
+
+    return " OR ".join(terms)
 
 def safe_parse_published_at(published_at_val: Any) -> Optional[datetime]:
     """
@@ -169,27 +202,21 @@ def mysql_connect(db: Optional[str] = None):
     return mysql.connector.connect(**cfg)
 
 def _index_exists(cur, table: str, index_name: str) -> bool:
-    # IMPORTANT: consume ALL rows to avoid "Unread result found"
     cur.execute(f"SHOW INDEX FROM `{table}` WHERE Key_name=%s", (index_name,))
-    rows = cur.fetchall()  # clears result set
+    rows = cur.fetchall()
     return len(rows) > 0
 
 def _column_exists(cur, table: str, col: str) -> bool:
-    # IMPORTANT: consume ALL rows to avoid "Unread result found"
     cur.execute(f"SHOW COLUMNS FROM `{table}` LIKE %s", (col,))
-    rows = cur.fetchall()  # clears result set
+    rows = cur.fetchall()
     return len(rows) > 0
 
 def ensure_table():
     """
-    Keeps your original schema, but applies FIX #2:
-      - allow same URL to be stored for multiple companies/tickers
-      - do this by adding url_hash and unique(company, url_hash)
-      - drop uniq_url if it exists (otherwise you can never store per-ticker rows)
-
-    Also applies FIX #3:
-      - avoid mysql.connector "Unread result found" by using buffered cursors
-        AND by consuming all rows in _index_exists/_column_exists.
+    Creates/migrates table and applies:
+      - url_hash + unique(company,url_hash)
+      - buffered cursors + consuming results
+      - widen market_time_horizon to TEXT to avoid MySQL 1406
     """
     # --- Create DB ---
     cnx = mysql_connect()
@@ -247,10 +274,9 @@ def ensure_table():
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
 
-    # --- Debug prints (so you can see progress) ---
     print(f"[ensure_table] connected -> {MYSQL_HOST}:{MYSQL_PORT} db={MYSQL_DB} table={MYSQL_TABLE}")
 
-    # If table existed before, ensure url_hash exists
+    # Ensure url_hash exists
     has_url_hash = _column_exists(cur, MYSQL_TABLE, "url_hash")
     print(f"[ensure_table] column url_hash exists? {has_url_hash}")
     if not has_url_hash:
@@ -276,6 +302,13 @@ def ensure_table():
             print("[ensure_table] added index uniq_company_urlhash (company(191), url_hash)")
         except Exception as e:
             print(f"[ensure_table] WARNING: failed to add uniq_company_urlhash: {type(e).__name__}: {e}")
+
+    # Widen market_time_horizon to TEXT (avoids 1406)
+    try:
+        cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` MODIFY COLUMN market_time_horizon TEXT NULL")
+        print("[ensure_table] widened market_time_horizon -> TEXT")
+    except Exception as e:
+        print(f"[ensure_table] NOTE: could not modify market_time_horizon: {type(e).__name__}: {e}")
 
     cur.close()
     cnx.close()
@@ -575,10 +608,11 @@ def build_runtime(cfg: dict) -> dict:
 
     companies = (cfg.get("query") or {}).get("companies") or []
 
+    # ---- TICKERS (NOW INCLUDES KEYWORDS) ----
     tickers_cfg = cfg.get("tickers") or {}
     tickers_mode = (tickers_cfg.get("mode") or "").strip().lower()
     tickers_track = tickers_cfg.get("track") or []
-    tickers: List[Dict[str, str]] = []
+    tickers: List[Dict[str, Any]] = []
     if tickers_mode == "explicit" and isinstance(tickers_track, list):
         for t in tickers_track:
             if not isinstance(t, dict):
@@ -587,7 +621,8 @@ def build_runtime(cfg: dict) -> dict:
             if not sym:
                 continue
             nm = strip_or_none(t.get("name")) or sym
-            tickers.append({"ticker": sym, "name": nm})
+            kws = [str(k).strip() for k in (t.get("keywords") or []) if str(k).strip()]
+            tickers.append({"ticker": sym, "name": nm, "keywords": kws})
 
     if not companies and not tickers:
         raise RuntimeError("news.json must include query.companies and/or tickers.track (mode=explicit).")
@@ -660,6 +695,8 @@ def run_once() -> Tuple[int, datetime]:
 
             try:
                 analysis, perf = analyze_article(client, model, a)
+                mi = (analysis.get("market_impact") or {})
+
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
@@ -680,13 +717,14 @@ def run_once() -> Tuple[int, datetime]:
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
 
-                    "sentiment": analysis.get("sentiment"),
+                    "sentiment": clamp_str(analysis.get("sentiment"), 16),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
 
-                    "market_direction": (analysis.get("market_impact") or {}).get("direction"),
-                    "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
-                    "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+                    "market_direction": clamp_str(mi.get("direction"), 16),
+                    # TEXT in DB, but clamp anyway (prevents insane outputs)
+                    "market_time_horizon": clamp_str(mi.get("time_horizon"), 500),
+                    "market_rationale": mi.get("rationale"),
 
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
@@ -714,10 +752,12 @@ def run_once() -> Tuple[int, datetime]:
     for t in tickers:
         ticker = normalize_ticker(t.get("ticker"))
         name = strip_or_none(t.get("name")) or ticker
+        keywords = t.get("keywords") or []
         if not ticker:
             continue
 
-        search = build_ticker_search(ticker, name)
+        # ---- NOW USES KEYWORDS ----
+        search = build_ticker_search(ticker, name, keywords)
         if not search:
             continue
 
@@ -735,6 +775,8 @@ def run_once() -> Tuple[int, datetime]:
 
             try:
                 analysis, perf = analyze_article(client, model, a)
+                mi = (analysis.get("market_impact") or {})
+
                 batch.append({
                     "cycle": _STATE["cycle"],
                     "timestamp_utc": utc_now().replace(tzinfo=None, microsecond=0),
@@ -755,13 +797,13 @@ def run_once() -> Tuple[int, datetime]:
                     "locale": a.get("locale"),
                     "relevance_score": a.get("relevance_score"),
 
-                    "sentiment": analysis.get("sentiment"),
+                    "sentiment": clamp_str(analysis.get("sentiment"), 16),
                     "confidence_0_to_100": analysis.get("confidence_0_to_100"),
                     "one_sentence_summary": analysis.get("one_sentence_summary"),
 
-                    "market_direction": (analysis.get("market_impact") or {}).get("direction"),
-                    "market_time_horizon": (analysis.get("market_impact") or {}).get("time_horizon"),
-                    "market_rationale": (analysis.get("market_impact") or {}).get("rationale"),
+                    "market_direction": clamp_str(mi.get("direction"), 16),
+                    "market_time_horizon": clamp_str(mi.get("time_horizon"), 500),
+                    "market_rationale": mi.get("rationale"),
 
                     "elapsed_s": perf.get("elapsed_s"),
                     "prompt_tokens": perf.get("prompt_tokens"),
