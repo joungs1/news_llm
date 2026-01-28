@@ -637,18 +637,27 @@ DASHBOARD_HTML = r"""<!doctype html>
     const m = payload.meta || {};
     const title = `${m.ticker || ""} — ${m.period || ""} @ ${m.interval || ""} (as-of ${m.as_of_date || ""})`;
 
+    // ✅ Remove weekend gaps on time axis
+    // Plotly rangebreak: skip from Saturday -> Monday
+    const weekendRangebreaks = [{ bounds: ["sat", "mon"] }];
+
     const layout = {
       title,
       height: 900,
       margin: {l:50, r:30, t:90, b:40},
       legend: {orientation:"h", yanchor:"bottom", y:1.02, xanchor:"left", x:0},
-      xaxis:  {domain:[0,1], anchor:"y", rangeslider:{visible:false}},
+
+      // Apply to all x-axes used (because you have matched subpanels)
+      xaxis:  {domain:[0,1], anchor:"y", rangeslider:{visible:false}, rangebreaks: weekendRangebreaks},
       yaxis:  {domain:[0.45,1.0], title:"Price"},
-      xaxis2: {domain:[0,1], anchor:"y2", matches:"x", showticklabels:false},
+
+      xaxis2: {domain:[0,1], anchor:"y2", matches:"x", showticklabels:false, rangebreaks: weekendRangebreaks},
       yaxis2: {domain:[0.30,0.43], title:"Volume"},
-      xaxis3: {domain:[0,1], anchor:"y3", matches:"x"},
+
+      xaxis3: {domain:[0,1], anchor:"y3", matches:"x", rangebreaks: weekendRangebreaks},
       yaxis3: {domain:[0.0,0.26], title:"RSI", range:[0,100]},
       yaxis4: {domain:[0.0,0.26], title:"MACD Hist", overlaying:"y3", side:"right", showgrid:false},
+
       shapes: [
         {type:"line", xref:"paper", yref:"y3", x0:0, x1:1, y0:70, y1:70, line:{width:1}},
         {type:"line", xref:"paper", yref:"y3", x0:0, x1:1, y0:30, y1:30, line:{width:1}},
