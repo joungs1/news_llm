@@ -20,6 +20,13 @@ try:
 except Exception:
     BeautifulSoup = None  # type: ignore
 
+
+class ModelOutputError(Exception):
+    """Raised when the model output cannot be parsed as the required JSON."""
+    def __init__(self, message: str, raw_text: str = ""):
+        super().__init__(message)
+        self.raw_text = raw_text or ""
+
 # ============================================================
 # CONFIG (env overrides)
 # ============================================================
@@ -701,12 +708,42 @@ def build_prompt(entity_name: str, llm_input_text: str) -> str:
         f"{llm_input_text}"
     )
 
+def build_repair_prompt(entity_name: str, llm_input_text: str, bad_output: str) -> str:
+    """Second-pass prompt to coerce strict JSON when the first pass wasn't valid JSON."""
+    schema = {
+        "sentiment": "positive|neutral|negative",
+        "confidence_0_to_100": 0,
+        "one_sentence_summary": "string",
+        "important_keywords": ["string", "..."],
+        "market_impact": {
+            "direction": "up|down|mixed|unclear",
+            "time_horizon": "intraday|days|weeks|months|unclear",
+            "rationale": "string"
+        }
+    }
+    bad_output = (bad_output or "").strip()
+    if len(bad_output) > 6000:
+        bad_output = bad_output[:6000] + "\n[TRUNCATED_BAD_OUTPUT]"
+    return (
+        "You must output ONLY valid JSON (a single object). No markdown, no commentary.\n"
+        "If the previous output contained extra text, discard it and rewrite it as JSON only.\n"
+        "Use ONLY the provided article input. Do not invent facts.\n\n"
+        f"Entity: {entity_name}\n\n"
+        f"Schema:\n{json.dumps(schema, indent=2)}\n\n"
+        "Article Input:\n"
+        f"{llm_input_text}\n\n"
+        "Previous (invalid) output to fix:\n"
+        f"{bad_output}"
+    )
+
 def analyze_article(client: OpenAI, model: str, entity_name: str, llm_input_text: str) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     t0 = time.time()
     last_err: Optional[Exception] = None
+    last_raw: str = ""
 
     for attempt in range(LLM_RETRIES + 1):
         try:
+            # 1) primary attempt
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": build_prompt(entity_name, llm_input_text)}],
@@ -715,8 +752,23 @@ def analyze_article(client: OpenAI, model: str, entity_name: str, llm_input_text
                 stream=False,
                 timeout=LLM_TIMEOUT_S,
             )
-            raw_text = (resp.choices[0].message.content or "").strip()
-            parsed = extract_json_object(raw_text)
+            last_raw = ((resp.choices[0].message.content or "")).strip()
+
+            try:
+                parsed = extract_json_object(last_raw)
+            except Exception as parse_err:
+                # 2) repair attempt (single pass, strict JSON rewrite)
+                repair = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": build_repair_prompt(entity_name, llm_input_text, last_raw)}],
+                    temperature=0.0,
+                    max_tokens=max(LLM_MAX_TOKENS, 900),
+                    stream=False,
+                    timeout=LLM_TIMEOUT_S,
+                )
+                repaired_raw = ((repair.choices[0].message.content or "")).strip()
+                last_raw = repaired_raw or last_raw
+                parsed = extract_json_object(last_raw)
 
             elapsed = time.time() - t0
             usage = getattr(resp, "usage", None)
@@ -726,15 +778,17 @@ def analyze_article(client: OpenAI, model: str, entity_name: str, llm_input_text
                 "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
                 "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
             }
-            return parsed, perf, raw_text
+            return parsed, perf, last_raw
+
         except Exception as e:
             last_err = e
+            # retry on transient errors / occasional bad output
             if attempt < LLM_RETRIES:
                 time.sleep(0.8 * (attempt + 1))
                 continue
-            raise
+            raise ModelOutputError(f"{type(e).__name__}: {e}", raw_text=last_raw)
 
-    raise RuntimeError(f"LLM failed: {last_err}")
+    raise ModelOutputError(f"LLM failed: {last_err}", raw_text=last_raw)
 
 # ============================================================
 # OLLAMA MODEL PICK
@@ -889,6 +943,7 @@ def run_once() -> None:
                 print(f"  [ok] {eid} title={clamp_str(a.get('title'), 90)!r}")
 
             except Exception as ex:
+                raw_failed = getattr(ex, "raw_text", None)
                 err = f"{type(ex).__name__}: {ex}"
                 print(f"  [llm_error] {eid} url_hash={url_hash} err={err}")
 
@@ -921,7 +976,7 @@ def run_once() -> None:
                     "llm_input_text": llm_input_text,
 
                     "analysis_json": None,
-                    "llm_raw_text": None,
+                    "llm_raw_text": raw_failed,
                     "error": err,
                 }
                 insert_row(row)
