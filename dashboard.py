@@ -371,12 +371,8 @@ def fetch_news_block(
 
     q = (
         select_sql
-        + "
-WHERE " + "
-  AND ".join(where_parts)
-        + "
-ORDER BY timestamp_utc DESC
-LIMIT %s"
+        + "\nWHERE " + "\n  AND ".join(where_parts)
+        + "\nORDER BY timestamp_utc DESC\nLIMIT %s"
     )
     params.append(int(limit))
 
@@ -393,14 +389,6 @@ def fetch_global_news_block(d: date_cls) -> Dict[str, Any]:
     # Also try a fallback key if user configured GLOBAL_NEWS_COMPANY as display name but rows store 'macro', or vice versa.
     if not items and GLOBAL_NEWS_COMPANY != "macro":
         items = fetch_news_block("macro", d, limit=GLOBAL_NEWS_LIMIT, entity_type=None)
-    return {"company": GLOBAL_NEWS_COMPANY, "date": str(d), "items": items}
-
-
-# ============================================================
-# AI: same-day recommendation
-# ============================================================
-(d: date_cls) -> Dict[str, Any]:
-    items = fetch_news_block(GLOBAL_NEWS_COMPANY, d, limit=GLOBAL_NEWS_LIMIT, entity_type="company")
     return {"company": GLOBAL_NEWS_COMPANY, "date": str(d), "items": items}
 
 
