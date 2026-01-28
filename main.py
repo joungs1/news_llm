@@ -58,7 +58,7 @@ def main():
     # 2) Start job loops
     threads = [
         threading.Thread(target=loop_job, args=("news_api", news_api.run_once, NEWS_EVERY_S), daemon=True),
-        threading.Thread(target=loop_job, args=("finance", finance.run_once, FINANCE_EVERY_S), daemon=True),
+##        threading.Thread(target=loop_job, args=("finance", finance.run_once, FINANCE_EVERY_S), daemon=True),
         threading.Thread(target=loop_job, args=("ai", ai.run_once, AI_EVERY_S), daemon=True),
     ]
     for t in threads:
