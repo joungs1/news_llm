@@ -45,12 +45,7 @@ T_AI = os.getenv("MYSQL_TABLE_AI", "ai_recommendations")
 USE_UTC_DAY = os.getenv("USE_UTC_DAY", "1").strip() == "1"
 NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
 
-# Main bars (used for indicator summary if your cache stores it)
-BARS_LIMIT = int(os.getenv("BARS_LIMIT", "200"))
-BARS_INTERVAL_MAIN = os.getenv("BARS_INTERVAL_MAIN", "1d")
-BARS_PERIOD_MAIN = os.getenv("BARS_PERIOD_MAIN", "6mo")
-
-# **Requested**: past day 15m, include ALL columns
+# **Requested**: past day 15m, include ALL finance columns
 BARS_INTERVAL_15M = os.getenv("BARS_INTERVAL_15M", "15m")
 BARS_PERIOD_15M = os.getenv("BARS_PERIOD_15M", "1d")
 BARS_LIMIT_15M = int(os.getenv("BARS_LIMIT_15M", "200"))  # 1d of 15m ~ 26–30 bars
@@ -68,6 +63,39 @@ SLEEP_BETWEEN_TICKERS_S = float(os.getenv("SLEEP_BETWEEN_TICKERS_S", "0.2"))
 
 # Finance staleness policy
 MAX_STALE_DAYS = int(os.getenv("MAX_STALE_DAYS", "7"))  # treat older than N days as missing
+
+# If true, normalize ALL datetime fields in finance rows to ISO strings (in addition to DB-write sanitization)
+NORMALIZE_ALL_DATETIME_FIELDS = os.getenv("NORMALIZE_ALL_DATETIME_FIELDS", "1").strip() == "1"
+
+# ============================================================
+# JSON SANITIZATION (FIXES: "datetime is not JSON serializable")
+# ============================================================
+
+def json_sanitize(obj: Any) -> Any:
+    """
+    Recursively convert non-JSON-native types (datetime/date/bytes/etc.) to JSON-safe types.
+    Use this BEFORE json.dumps when storing JSON blobs to MySQL.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            # treat as UTC-naive
+            return obj.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        return obj.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(obj, date_cls):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, list):
+        return [json_sanitize(x) for x in obj]
+    if isinstance(obj, tuple):
+        return [json_sanitize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): json_sanitize(v) for k, v in obj.items()}
+    return str(obj)
 
 # ============================================================
 # TIME HELPERS
@@ -87,7 +115,6 @@ def utc_day_window(d: Optional[date_cls] = None) -> Tuple[datetime, datetime]:
         end = start + timedelta(days=1)
         return start, end
 
-    # local day fallback (rarely needed)
     now_local = datetime.now()
     d = d or date_cls(now_local.year, now_local.month, now_local.day)
     start_local = datetime(d.year, d.month, d.day)
@@ -110,17 +137,12 @@ def normalize_ticker(raw: Any) -> str:
     return s
 
 def ticker_variants(t: str) -> List[str]:
-    """
-    Variants to handle storage mismatches across finance/news.
-    """
     t = normalize_ticker(t)
     out = [t]
     if t and "." not in t:
-        out.append(t + ".TO")      # RY -> RY.TO
+        out.append(t + ".TO")
     if t.endswith(".TO"):
-        out.append(t[:-3])         # RY.TO -> RY
-
-    # de-dupe preserve order
+        out.append(t[:-3])
     seen = set()
     dedup = []
     for x in out:
@@ -175,7 +197,6 @@ def mysql_connect(db: str):
     )
 
 def ensure_ai_db_and_table() -> None:
-    # create DB
     cnx = mysql.connector.connect(
         host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD, autocommit=True
     )
@@ -184,7 +205,6 @@ def ensure_ai_db_and_table() -> None:
     cur.close()
     cnx.close()
 
-    # create table
     cnx = mysql_connect(DB_AI)
     cur = cnx.cursor()
     cur.execute(f"""
@@ -249,6 +269,10 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
       input_digest=VALUES(input_digest),
       error=VALUES(error);
     """
+
+    simplified = row.get("simplified")
+    input_digest = row.get("input_digest")
+
     vals = (
         row["run_date"],
         row["as_of_utc"],
@@ -258,8 +282,8 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
         row.get("stance"),
         row.get("confidence_0_to_100"),
         row.get("recommendation_sentence"),
-        json.dumps(row.get("simplified"), ensure_ascii=False) if row.get("simplified") is not None else None,
-        json.dumps(row.get("input_digest"), ensure_ascii=False) if row.get("input_digest") is not None else None,
+        json.dumps(json_sanitize(simplified), ensure_ascii=False) if simplified is not None else None,
+        json.dumps(json_sanitize(input_digest), ensure_ascii=False) if input_digest is not None else None,
         row.get("error"),
     )
     cur.execute(sql, vals)
@@ -267,15 +291,12 @@ def upsert_ai_row(row: Dict[str, Any]) -> None:
     cnx.close()
 
 # ============================================================
-# FINANCE TABLE INTROSPECTION (interval/period columns + full column list)
+# FINANCE TABLE INTROSPECTION + FETCH (ALL COLUMNS)
 # ============================================================
 
 _FIN_SCHEMA: Optional[Dict[str, Any]] = None
 
 def get_fin_schema() -> Dict[str, Any]:
-    """
-    Detect optional filter columns and list all columns for 'SELECT ...' builds.
-    """
     global _FIN_SCHEMA
     if _FIN_SCHEMA is not None:
         return _FIN_SCHEMA
@@ -295,7 +316,6 @@ def get_fin_schema() -> Dict[str, Any]:
     interval_col = next((c for c in interval_candidates if c in lc), None)
     period_col = next((c for c in period_candidates if c in lc), None)
 
-    # map back to actual case-sensitive column name if needed
     interval_col_real = None
     period_col_real = None
     if interval_col:
@@ -310,6 +330,17 @@ def get_fin_schema() -> Dict[str, Any]:
     }
     return _FIN_SCHEMA
 
+def _normalize_row_datetimes_in_place(row: Dict[str, Any]) -> None:
+    if not NORMALIZE_ALL_DATETIME_FIELDS:
+        return
+    for k, v in list(row.items()):
+        if isinstance(v, datetime):
+            # store as ISO string
+            if v.tzinfo is None:
+                row[k] = v.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
+                row[k] = v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def fetch_finance_bars_filtered(
     ticker: str,
     *,
@@ -318,19 +349,16 @@ def fetch_finance_bars_filtered(
     limit: int,
     select_columns: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch bars for a ticker with optional (interval, period) filters IF columns exist.
-    """
     schema = get_fin_schema()
     interval_col = schema["interval_col"]
     period_col = schema["period_col"]
 
+    # default if caller didn't pass select_columns
     cols = select_columns or ["ts_utc", "open", "high", "low", "close", "volume", "ema20", "vwap", "rsi14", "macd_hist", "bb_up", "bb_mid", "bb_low"]
 
-    # Build safe SELECT list from schema-known columns only
     allowed = set(schema["columns"])
     cols = [c for c in cols if c in allowed]
-    if "ticker" not in cols and "ticker" in allowed:
+    if "ticker" in allowed and "ticker" not in cols:
         cols = ["ticker"] + cols
 
     select_list = ", ".join([f"`{c}`" for c in cols])
@@ -361,10 +389,15 @@ def fetch_finance_bars_filtered(
     cur.close()
     cnx.close()
 
+    # chronological
     rows = list(reversed(rows))
+
+    # Always normalize ts_utc if present; optionally normalize ALL datetime fields
     for r in rows:
         if isinstance(r.get("ts_utc"), datetime):
             r["ts_utc"] = r["ts_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        _normalize_row_datetimes_in_place(r)
+
     return rows
 
 def fetch_finance_any_variant(
@@ -375,10 +408,6 @@ def fetch_finance_any_variant(
     limit: int,
     select_columns: Optional[List[str]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Try ticker variants until we get data.
-    Returns (matched_ticker, rows) or (original, []).
-    """
     for cand in ticker_variants(ticker):
         rows = fetch_finance_bars_filtered(
             cand,
@@ -395,10 +424,8 @@ def is_stale_ts(ts_iso: Optional[str]) -> bool:
     if not ts_iso:
         return True
     try:
-        # ts_iso like "2026-01-27T19:35:00Z"
         ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-        age = utc_now() - ts
-        return age > timedelta(days=MAX_STALE_DAYS)
+        return (utc_now() - ts) > timedelta(days=MAX_STALE_DAYS)
     except Exception:
         return True
 
@@ -426,6 +453,9 @@ def fetch_news_in_window(company_key: str, start_utc: datetime, end_utc: datetim
     for r in rows:
         if isinstance(r.get("timestamp_utc"), datetime):
             r["timestamp_utc"] = r["timestamp_utc"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        # optional: normalize any other datetime fields
+        _normalize_row_datetimes_in_place(r)
+
     return rows
 
 def candidate_news_keys(name: str, ticker: str) -> List[str]:
@@ -434,7 +464,6 @@ def candidate_news_keys(name: str, ticker: str) -> List[str]:
         keys.append(name)
     for t in ticker_variants(ticker):
         keys.append(t)
-    # de-dupe keep order
     out: List[str] = []
     for k in keys:
         if k and k not in out:
@@ -490,7 +519,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return json.loads(raw[start:i+1])
+                    return json.loads(raw[start:i + 1])
 
     raise ValueError("Found '{' but could not extract a complete JSON object")
 
@@ -557,9 +586,6 @@ def summarize_finance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ============================================================
 
 def slim_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep LLM input small. We store full 15m data separately in input_digest.
-    """
     news = packet.get("news_rows") or []
     news_small: List[Dict[str, Any]] = []
     for n in news[:3]:
@@ -619,7 +645,6 @@ def validate_llm_output(out: Dict[str, Any], expected_ticker: str) -> Dict[str, 
     if not rec:
         raise ValueError("Empty recommendation_sentence")
 
-    # HARD FORCE prefix
     prefix = f"{expected_ticker}:"
     if not rec.startswith(prefix):
         rec = f"{prefix} {rec}"
@@ -629,7 +654,6 @@ def validate_llm_output(out: Dict[str, Any], expected_ticker: str) -> Dict[str, 
         rec = rec[:220].rstrip()
     out["recommendation_sentence"] = rec
 
-    # Soft note if other tracked tickers appear (do not fail)
     if _KNOWN_TICKERS:
         upper = rec.upper()
         others = []
@@ -776,13 +800,13 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
         name = item["name"]
 
         try:
-            # --- Finance: past day, 15m, ALL columns (stored for inspection / dashboard)
+            # Finance: past day, 15m, ALL columns (store for inspection)
             matched_15m, bars_15m_full = fetch_finance_any_variant(
                 ticker,
                 interval_val=BARS_INTERVAL_15M,
                 period_val=BARS_PERIOD_15M,
                 limit=BARS_LIMIT_15M,
-                select_columns=all_fin_cols,   # ALL columns
+                select_columns=all_fin_cols,  # ALL columns
             )
 
             # Trim stored full bars to avoid giant JSON rows
@@ -790,7 +814,7 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
 
             fin_summary_15m = summarize_finance(bars_15m_full)
 
-            # --- News: try name + ticker variants
+            # News: try name + ticker variants
             matched_news_key, news_rows = fetch_news_any_key(name, ticker, start_utc, end_utc)
 
             packet = {
@@ -822,7 +846,7 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
                         "requested_period": BARS_PERIOD_15M,
                         "matched_ticker_15m": matched_15m,
                         "bars_15m_rows": len(bars_15m_full),
-                        "bars_15m_full": bars_15m_full_store,  # ALL COLUMNS (trimmed)
+                        "bars_15m_full": bars_15m_full_store,  # ALL columns (trimmed)
                         "summary_15m": fin_summary_15m,
                         "schema": {"interval_col": schema["interval_col"], "period_col": schema["period_col"]},
                     },
@@ -851,7 +875,6 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
             err = f"{type(e).__name__}: {e}"
             errors.append(f"{ticker}: {err}")
 
-            # save fallback row
             fallback = neutral_fallback(err, ticker)
             row = {
                 "run_date": run_date_val,
@@ -889,7 +912,7 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
 
 def main():
     summary = main_run_once()
-    print("[AI]", json.dumps(summary, indent=2))
+    print("[AI]", json.dumps(summary, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
