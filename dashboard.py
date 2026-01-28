@@ -640,7 +640,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     .small { font-size:12px; color:#666; }
     a { color:#0b5fff; text-decoration:none; }
     a:hover { text-decoration:underline; }
-  </style>
+  
+  /* Global news rotator */
+  .rotator { display:flex; flex-direction:column; gap:8px; }
+  .rotator-controls { display:flex; align-items:center; gap:8px; }
+  .rotator-controls button { padding:6px 10px; border:1px solid #2a3245; background:#141a29; color:#e7eefc; border-radius:8px; cursor:pointer; }
+  .rotator-controls button:hover { background:#1a2236; }
+  .rotator-counter { color:#9fb1d4; font-size:12px; }
+</style>
 </head>
 <body>
 
@@ -842,6 +849,95 @@ DASHBOARD_HTML = r"""<!doctype html>
     }).join("");
   }
 
+  // --- Global News Rotator (shows one item at a time, auto-rotates) ---
+  let _globalRot = { items: [], idx: 0, timer: null, intervalMs: 6500 };
+
+  function stopGlobalRotator() {
+    if (_globalRot.timer) { clearInterval(_globalRot.timer); _globalRot.timer = null; }
+  }
+
+  function startGlobalRotator() {
+    stopGlobalRotator();
+    if (!_globalRot.items || _globalRot.items.length <= 1) return;
+    _globalRot.timer = setInterval(() => {
+      _globalRot.idx = (_globalRot.idx + 1) % _globalRot.items.length;
+      renderGlobalRotatorFrame();
+    }, _globalRot.intervalMs);
+  }
+
+  function renderGlobalRotatorFrame() {
+    const containerEl = elGlobalNews;
+    const items = _globalRot.items || [];
+    if (!items.length) return;
+
+    const n = items[_globalRot.idx] || {};
+    const title = n.title || "(no title)";
+    const url = n.url || "";
+    const source = n.source || "";
+    const ts = n.timestamp_utc || n.published_at || "";
+    const sent = n.sentiment || "";
+    const conf = (n.confidence_0_to_100 === null || n.confidence_0_to_100 === undefined) ? "" : ` (${n.confidence_0_to_100})`;
+    const sum = n.one_sentence_summary || "";
+    const err = n.error ? ` • ⚠ ${n.error}` : "";
+
+    const bodyHtml = `
+      <div class="news-item">
+        <div class="news-title">${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>` : escapeHtml(title)}</div>
+        <div class="news-meta">${escapeHtml(source)} • ${escapeHtml(ts)} • ${escapeHtml(sent)}${escapeHtml(conf)}${escapeHtml(err)}</div>
+        <div class="news-sum">${escapeHtml(sum)}</div>
+      </div>
+    `;
+
+    // If wrapper not present, create it once
+    if (!containerEl.dataset.rotatorReady) {
+      containerEl.dataset.rotatorReady = "1";
+      containerEl.innerHTML = `
+        <div class="rotator">
+          <div id="globalRotBody"></div>
+          <div class="rotator-controls">
+            <button id="globalRotPrev" type="button">Prev</button>
+            <div class="rotator-counter" id="globalRotCounter"></div>
+            <button id="globalRotNext" type="button">Next</button>
+          </div>
+        </div>
+      `;
+      containerEl.addEventListener("mouseenter", stopGlobalRotator);
+      containerEl.addEventListener("mouseleave", startGlobalRotator);
+
+      containerEl.querySelector("#globalRotPrev").addEventListener("click", () => {
+        _globalRot.idx = (_globalRot.idx - 1 + _globalRot.items.length) % _globalRot.items.length;
+        renderGlobalRotatorFrame();
+      });
+      containerEl.querySelector("#globalRotNext").addEventListener("click", () => {
+        _globalRot.idx = (_globalRot.idx + 1) % _globalRot.items.length;
+        renderGlobalRotatorFrame();
+      });
+    }
+
+    const body = containerEl.querySelector("#globalRotBody");
+    const counter = containerEl.querySelector("#globalRotCounter");
+    if (body) body.innerHTML = bodyHtml;
+    if (counter) counter.textContent = `${_globalRot.idx + 1} / ${_globalRot.items.length}`;
+  }
+
+  function renderGlobalNewsRotator(items, emptyMsg) {
+    stopGlobalRotator();
+    _globalRot.items = items || [];
+    _globalRot.idx = 0;
+
+    if (!_globalRot.items.length) {
+      elGlobalNews.textContent = emptyMsg;
+      elGlobalNews.dataset.rotatorReady = "";
+      return;
+    }
+
+    // Clear so wrapper rebuilds when switching dates
+    elGlobalNews.dataset.rotatorReady = "";
+    renderGlobalRotatorFrame();
+    startGlobalRotator();
+  }
+
+
   function renderAI(row) {
     if (!row) {
       elAI.innerHTML = "No AI recommendation found for this ticker on this date.";
@@ -934,7 +1030,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     try {
       // Global news (independent of ticker)
       const g = await apiGet(`/api/global_news?date=${encodeURIComponent(d)}`);
-      renderNewsItems(elGlobalNews, g.items, "No global news rows found for this date.");
+      renderGlobalNewsRotator(g.items, "No global news rows found for this date.");
 
       const finance = await apiGet(`/api/finance?ticker=${encodeURIComponent(ticker)}&interval=${encodeURIComponent(interval)}&period=${encodeURIComponent(period)}&date=${encodeURIComponent(d)}`);
       const fig = buildFigure(finance);
