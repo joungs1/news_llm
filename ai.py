@@ -910,8 +910,16 @@ def main_run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int
         "ts_utc": utc_now().isoformat(),
     }
 
+def run_once(run_date: Optional[date_cls] = None, max_tickers: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Backwards-compatible wrapper.
+    Your repo expects ai.run_once(), so keep this stable.
+    """
+    return main_run_once(run_date=run_date, max_tickers=max_tickers)
+
+
 def main():
-    summary = main_run_once()
+    summary = run_once()
     print("[AI]", json.dumps(summary, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
