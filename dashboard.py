@@ -4,21 +4,13 @@ from __future__ import annotations
 """
 MySQL-backed dashboard (Finance + News + AI) served over HTTP (Tailscale-friendly).
 
-This version is BACKWARD-COMPATIBLE with BOTH News schemas:
+Fix in this version:
+- News blocks (global + ticker) now filter by the ARTICLE PUBLISHED TIME, not ingestion time.
+  Your table has published time in VARCHAR columns like `published_at` or `publishedAt`,
+  while `timestamp_utc` is when your pipeline processed the article.
+  That mismatch is why "selected day" was empty.
 
-OLD schema (your older scripts):
-- News table has a `company` column and dashboard queries `WHERE company=%s`
-
-NEW schema (your newer news_api.py):
-- News table uses:
-    entity_type  ('company' or 'ticker')
-    entity_id    (company id like 'macro' OR ticker like 'SU.TO')
-    display_name (human name like 'Global Macro & Markets' OR 'SU.TO - Suncor')
-- dashboard queries by entity_id/display_name automatically
-
-Also:
-- GLOBAL_NEWS_COMPANY default changed to "macro" (stable key for your Global Macro entity)
-  but it will also work if you set it to "Global Macro & Markets" because we try both.
+Finance DB logic is unchanged.
 """
 
 import os
@@ -139,8 +131,31 @@ def col_exists(db: str, table: str, col: str) -> bool:
     return int(n) > 0
 
 
+def news_published_dt_sql(colname: str) -> str:
+    """
+    Build a MySQL expression that parses common published_at/publishedAt string formats into DATETIME (UTC).
+    Handles:
+      - 'YYYY-mm-dd HH:MM:SS'
+      - 'YYYY-mm-ddTHH:MM:SSZ'
+      - 'YYYY-mm-ddTHH:MM:SS.ffffffZ'
+      - same with '+00:00' timezone suffix
+    """
+    # Strip Z and +00:00 to make parsing simpler.
+    cleaned = f"REPLACE(REPLACE({colname}, 'Z', ''), '+00:00', '')"
+
+    # Branch on whether it's ISO ('T' separator) and whether it has fractional seconds.
+    return f"""
+    CASE
+      WHEN {colname} IS NULL OR {colname}='' THEN NULL
+      WHEN {colname} LIKE '%T%' AND {colname} LIKE '%.%' THEN STR_TO_DATE({cleaned}, '%Y-%m-%dT%H:%i:%s.%f')
+      WHEN {colname} LIKE '%T%' THEN STR_TO_DATE({cleaned}, '%Y-%m-%dT%H:%i:%s')
+      ELSE STR_TO_DATE({colname}, '%Y-%m-%d %H:%i:%s')
+    END
+    """.strip()
+
+
 # ============================================================
-# Finance: availability + data
+# Finance: availability + data (UNCHANGED)
 # ============================================================
 def fetch_tickers_from_finance() -> List[str]:
     cnx = mysql_connect(MYSQL_DB_FINANCE)
@@ -304,7 +319,7 @@ def fetch_analyst_block(ticker: str, d: date_cls) -> Dict[str, Any]:
 
 
 # ============================================================
-# News: same-day important items (BACKWARD COMPATIBLE)
+# News: same-day important items (FIXED: use published_dt)
 # ============================================================
 def fetch_news_block(
     key: str,
@@ -320,7 +335,6 @@ def fetch_news_block(
 
     entity_type:
       - optional filter for NEW schema ('ticker' or 'company')
-      - kept optional to avoid breaking old data
     """
     start_utc, end_utc = day_window(d)
 
@@ -329,17 +343,44 @@ def fetch_news_block(
     has_display_name = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "display_name")
     has_entity_type = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "entity_type")
 
+    # Published time columns (VARCHAR in your schema)
+    has_published_at = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "published_at")
+    has_publishedAt = col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "publishedAt")
+
+    published_col = None
+    if has_published_at:
+        published_col = "published_at"
+    elif has_publishedAt:
+        published_col = "publishedAt"
+
+    # Choose the time filtering expression:
+    # - Prefer parsed published time
+    # - Fall back to timestamp_utc if published time not available
+    if published_col:
+        published_dt_expr = news_published_dt_sql(published_col)
+        time_filter_expr = f"({published_dt_expr})"
+        order_expr = f"({published_dt_expr})"
+    else:
+        published_dt_expr = "timestamp_utc"
+        time_filter_expr = "timestamp_utc"
+        order_expr = "timestamp_utc"
+
     cnx = mysql_connect(MYSQL_DB_NEWS)
     cur = cnx.cursor(dictionary=True)
 
+    # Include published_dt for UI to show correct date/time
     select_sql = f"""
-        SELECT timestamp_utc, published_at, source, title, url,
-               one_sentence_summary, sentiment, confidence_0_to_100
+        SELECT
+          timestamp_utc,
+          {published_col if published_col else "NULL"} AS published_raw,
+          {published_dt_expr} AS published_dt,
+          source, title, url,
+          one_sentence_summary, sentiment, confidence_0_to_100
         FROM `{MYSQL_TABLE_NEWS}`
     """
 
     where_parts: List[str] = [
-        "timestamp_utc >= %s AND timestamp_utc < %s",
+        f"{time_filter_expr} >= %s AND {time_filter_expr} < %s",
         "(error IS NULL OR error = '')",
     ]
     params: List[Any] = [dt_utc_naive(start_utc), dt_utc_naive(end_utc)]
@@ -372,7 +413,7 @@ def fetch_news_block(
     q = (
         select_sql
         + "\nWHERE " + "\n  AND ".join(where_parts)
-        + "\nORDER BY timestamp_utc DESC\nLIMIT %s"
+        + f"\nORDER BY {order_expr} DESC\nLIMIT %s"
     )
     params.append(int(limit))
 
@@ -389,7 +430,7 @@ def fetch_global_news_block(d: date_cls) -> Dict[str, Any]:
 
 
 # ============================================================
-# AI: same-day recommendation
+# AI: same-day recommendation (UNCHANGED)
 # ============================================================
 def fetch_ai_block(ticker: str, d: date_cls) -> Optional[Dict[str, Any]]:
     start_utc, end_utc = day_window(d)
@@ -447,6 +488,8 @@ def api_health():
             "entity_id": col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "entity_id"),
             "display_name": col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "display_name"),
             "entity_type": col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "entity_type"),
+            "published_at": col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "published_at"),
+            "publishedAt": col_exists(MYSQL_DB_NEWS, MYSQL_TABLE_NEWS, "publishedAt"),
         }
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
@@ -772,7 +815,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       const title = n.title || "(no title)";
       const url = n.url || "";
       const source = n.source || "";
-      const ts = n.timestamp_utc || n.published_at || "";
+      // Prefer published_dt (computed), then fallback
+      const ts = n.published_dt || n.published_raw || n.timestamp_utc || "";
       const sent = n.sentiment || "";
       const conf = (n.confidence_0_to_100 === null || n.confidence_0_to_100 === undefined) ? "" : ` (${n.confidence_0_to_100})`;
       const sum = n.one_sentence_summary || "";
