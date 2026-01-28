@@ -1,7 +1,7 @@
 {
   "polling": {
     "interval_seconds": 5000,
-    "lookback_minutes": 1440,
+    "lookback_minutes": 30,
     "language": "en",
     "limit": 50,
     "iterations": null
