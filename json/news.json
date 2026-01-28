@@ -96,83 +96,43 @@
       {
         "name": "iShares U.S. Aggregate Bond ETF",
         "ticker": "XAGG.TO",
-        "keywords": [
-          "iShares U.S. Aggregate Bond ETF",
-          "iShares US Aggregate Bond",
-          "XAGG",
-          "XAGG.TO"
-        ]
+        "keywords": ["iShares U.S. Aggregate Bond ETF", "iShares US Aggregate Bond", "XAGG", "XAGG.TO"]
       },
       {
         "name": "Vanguard Canadian Aggregate Bond ETF",
         "ticker": "VAB.TO",
-        "keywords": [
-          "Vanguard Canadian Aggregate Bond ETF",
-          "Vanguard Canada Aggregate Bond",
-          "VAB",
-          "VAB.TO"
-        ]
+        "keywords": ["Vanguard Canadian Aggregate Bond ETF", "Vanguard Canada Aggregate Bond", "VAB", "VAB.TO"]
       },
       {
         "name": "iShares Emerging Markets Bond ETF",
         "ticker": "XEB.TO",
-        "keywords": [
-          "iShares Emerging Markets Bond ETF",
-          "iShares EM Bond",
-          "XEB",
-          "XEB.TO"
-        ]
+        "keywords": ["iShares Emerging Markets Bond ETF", "iShares EM Bond", "XEB", "XEB.TO"]
       },
 
       {
         "name": "Global X Uranium ETF",
         "ticker": "HURA.TO",
-        "keywords": [
-          "Global X Uranium ETF",
-          "Uranium ETF",
-          "HURA",
-          "HURA.TO"
-        ]
+        "keywords": ["Global X Uranium ETF", "Uranium ETF", "HURA", "HURA.TO"]
       },
       {
         "name": "iShares S&P/TSX Energy ETF",
         "ticker": "XEG.TO",
-        "keywords": [
-          "iShares S&P/TSX Energy ETF",
-          "iShares TSX Energy",
-          "XEG",
-          "XEG.TO"
-        ]
+        "keywords": ["iShares S&P/TSX Energy ETF", "iShares TSX Energy", "XEG", "XEG.TO"]
       },
       {
         "name": "iShares Global Gold ETF",
         "ticker": "XGD.TO",
-        "keywords": [
-          "iShares Global Gold ETF",
-          "Gold Miners ETF",
-          "XGD",
-          "XGD.TO"
-        ]
+        "keywords": ["iShares Global Gold ETF", "Gold Miners ETF", "XGD", "XGD.TO"]
       },
       {
         "name": "iShares Cybersecurity ETF",
         "ticker": "XHAK.TO",
-        "keywords": [
-          "iShares Cybersecurity ETF",
-          "Cybersecurity ETF",
-          "XHAK",
-          "XHAK.TO"
-        ]
+        "keywords": ["iShares Cybersecurity ETF", "Cybersecurity ETF", "XHAK", "XHAK.TO"]
       },
       {
         "name": "Evolve Cyber Security ETF",
         "ticker": "CYBR.TO",
-        "keywords": [
-          "Evolve Cyber Security ETF",
-          "Cybersecurity ETF Canada",
-          "CYBR",
-          "CYBR.TO"
-        ]
+        "keywords": ["Evolve Cyber Security ETF", "Cybersecurity ETF Canada", "CYBR", "CYBR.TO"]
       }
     ]
   },
@@ -181,9 +141,6 @@
     "endpoint": "all",
     "domains": {
       "include": [
-        /* =========================
-           CANADA – MAJOR MEDIA
-           ========================= */
         "theglobeandmail.com",
         "bnnbloomberg.ca",
         "financialpost.com",
@@ -191,23 +148,15 @@
         "cbc.ca",
         "ctvnews.ca",
         "globalnews.ca",
-      
-        /* =========================
-           CANADA – BUSINESS / ENERGY
-           ========================= */
+
         "canadianbusiness.com",
-        "oilprice.com",
-        "energynewsbulletin.net",
-        "boereport.com",
         "jwnenergy.com",
+        "boereport.com",
         "pipelineonline.ca",
         "mining.com",
         "canadianminingjournal.com",
         "northernminer.com",
-      
-        /* =========================
-           GLOBAL – WIRES / ANALYST STYLE
-           ========================= */
+
         "reuters.com",
         "bloomberg.com",
         "ft.com",
@@ -216,34 +165,24 @@
         "cnbc.com",
         "economist.com",
         "apnews.com",
-      
-        /* =========================
-           GLOBAL – RESEARCH / DATA PROVIDERS
-           ========================= */
+
         "spglobal.com",
         "spglobalenergy.com",
         "argusmedia.com",
         "morningstar.com",
         "fitchratings.com",
         "moodys.com",
-        "ratings.ihsmarkit.com",
-      
-        /* =========================
-           DEFENSE / MACRO / GEOPOL
-           ========================= */
+
         "defensenews.com",
         "breakingdefense.com",
         "csis.org",
         "rand.org",
         "atlanticcouncil.org",
-      
-        /* =========================
-           GLOBAL FINANCE LONGFORM
-           ========================= */
-        "nytimes.com",
-        "washingtonpost.com"
-      ],
 
+        "nytimes.com",
+        "washingtonpost.com",
+        "oilprice.com"
+      ],
       "exclude": [
         "reddit.com",
         "twitter.com",
