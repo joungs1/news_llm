@@ -39,9 +39,9 @@ DEFAULT_CONFIG_CANDIDATES = [
 DEFAULT_CONFIG_CANDIDATES = [p for p in DEFAULT_CONFIG_CANDIDATES if p and str(p).strip()]
 
 # TheNewsAPI search guardrails
-MAX_ENTITY_KWS = int(os.getenv("NEWS_MAX_ENTITY_KWS", "12"))      # keep searches short & effective
-MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "700")) # TheNewsAPI tends to fail silently on huge queries
-SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()        # IMPORTANT: use "|" (works better than "OR")
+MAX_ENTITY_KWS = int(os.getenv("NEWS_MAX_ENTITY_KWS", "12"))
+MAX_SEARCH_CHARS = int(os.getenv("NEWS_MAX_SEARCH_CHARS", "700"))
+SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()  # IMPORTANT: works better than OR
 
 # Full-text extraction guardrails
 FULLTEXT_ENABLE = os.getenv("NEWS_FULLTEXT_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
@@ -152,7 +152,7 @@ def load_entities(cfg: dict) -> List[dict]:
     entities = cfg.get("entities")
     if not entities or not isinstance(entities, list):
         raise RuntimeError("news.json must include a top-level array: entities[]")
-    # basic validation
+
     out = []
     for e in entities:
         if not isinstance(e, dict):
@@ -167,34 +167,28 @@ def load_entities(cfg: dict) -> List[dict]:
             "ticker": normalize_ticker(ticker) if ticker else None,
             "keywords": kws,
         })
+
     if not out:
         raise RuntimeError("entities[] is empty after validation.")
     return out
 
 # ============================================================
-# SEARCH BUILDERS (FIX fetched=0)
+# SEARCH BUILDERS (avoid fetched=0)
 # ============================================================
 
 def _quote_term(term: str) -> str:
     term = term.strip()
     if not term:
         return ""
-    # Quote if spaces
     if re.search(r"\s", term):
         return f"\"{term}\""
     return term
 
 def _join_or(terms: List[str]) -> str:
     terms = [t for t in terms if t.strip()]
-    # TheNewsAPI search behaves better with '|' than literal OR
     return f" {SEARCH_OR_OP} ".join(terms)
 
 def build_entity_search(entity: dict) -> str:
-    """
-    High-signal short query:
-    - If ticker exists: include ticker + base + display name + a few keywords
-    - If macro/no ticker: use display name + keywords
-    """
     dn = entity.get("display_name") or ""
     ticker = entity.get("ticker")
 
@@ -206,21 +200,17 @@ def build_entity_search(entity: dict) -> str:
     if ticker:
         t = normalize_ticker(ticker)
         base = t.split(".")[0] if "." in t else t
-        # ticker terms first
         terms.append(_quote_term(t))
         if base and base != t:
             terms.append(_quote_term(base))
-        # name helps catch “Royal Bank of Canada” etc
         if dn:
             terms.append(_quote_term(dn))
-        # add only a few keywords (otherwise query too broad/too long)
         for k in kws[:8]:
             terms.append(_quote_term(k))
     else:
-        # macro entity: keep broad but not insane
         if dn:
             terms.append(_quote_term(dn))
-        for k in kws[:MAX_ENTITY_KWS]:
+        for k in kws:
             terms.append(_quote_term(k))
 
     q = _join_or(terms).strip()
@@ -253,7 +243,6 @@ def _column_exists(cur, table: str, col: str) -> bool:
     return len(cur.fetchall()) > 0
 
 def ensure_table() -> None:
-    # DB exists
     cnx = mysql_connect()
     cur = cnx.cursor(buffered=True)
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` DEFAULT CHARACTER SET utf8mb4")
@@ -337,7 +326,6 @@ def ensure_table() -> None:
             except Exception:
                 pass
 
-    # unique dedupe: entity_id + url_hash
     if not _index_exists(cur, MYSQL_TABLE, "uniq_entity_urlhash"):
         try:
             cur.execute(f"ALTER TABLE `{MYSQL_TABLE}` ADD UNIQUE KEY uniq_entity_urlhash (entity_id(128), url_hash)")
@@ -497,16 +485,11 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
         "page": 1,
     }
 
-    # domains
     include_domains, exclude_domains = _resolve_domains(cfg)
     if include_domains:
         params["domains"] = ",".join(include_domains)
     if exclude_domains:
         params["exclude_domains"] = ",".join(exclude_domains)
-
-    # NOTE:
-    # If you restrict to paywalled domains, TheNewsAPI often returns 0.
-    # If you still see fetched=0, temporarily comment out domains include in JSON to test.
 
     out: List[Dict[str, Any]] = []
     while True:
@@ -530,7 +513,7 @@ def fetch_thenewsapi(cfg: dict, search: str, after: datetime, before: datetime) 
     return out
 
 # ============================================================
-# FULL ARTICLE TEXT FETCH + EXTRACTION
+# FULL ARTICLE TEXT FETCH + EXTRACTION (NO NameError)
 # ============================================================
 
 def _rough_html_to_text(html: str) -> str:
@@ -604,7 +587,6 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
     raw = text.strip()
 
-    # direct JSON
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
@@ -612,7 +594,6 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # strip ``` blocks
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
         raw = re.sub(r"\s*```\s*$", "", raw).strip()
@@ -655,7 +636,6 @@ def build_llm_input_text(article: dict, full_text: Optional[str]) -> str:
     if full_text:
         parts.append(f"FULL_TEXT:\n{full_text}")
     else:
-        # fallback to what API gives
         desc = strip_or_none(article.get("description"))
         snip = strip_or_none(article.get("snippet"))
         content = strip_or_none(article.get("content"))
@@ -780,12 +760,10 @@ def run_once() -> None:
     preferred_model = model_cfg.get("preferred_model", "")
     fallback_idx = int(model_cfg.get("fallback_model_index", 0))
 
-    # LLM connect
     models = list_ollama_models(ollama_host)
     chosen_model = pick_model(models, preferred_model, fallback_idx)
     client = OpenAI(base_url=f"{ollama_host}/v1", api_key="ollama")
 
-    # Window
     end = utc_now()
     start = end - timedelta(minutes=lookback_minutes)
     cycle = int(time.time())
@@ -793,7 +771,7 @@ def run_once() -> None:
     print(f"[news_api] loaded_config={cfg.get('_loaded_from')}")
     print(f"[news_api] entities_loaded={len(entities)} model={chosen_model}")
     print(f"[news_api] window={iso_z(start)} -> {iso_z(end)} limit={limit}")
-    print(f"[news_api] search_or_op={SEARCH_OR_OP!r} max_entity_kws={MAX_ENTITY_KWS} max_search_chars={MAX_SEARCH_CHARS}")
+    print(f"[news_api] BeautifulSoup={'yes' if BeautifulSoup is not None else 'no'} FULLTEXT_ENABLE={FULLTEXT_ENABLE}")
 
     for e in entities:
         eid = e["id"]
@@ -804,12 +782,8 @@ def run_once() -> None:
         print(f"\n[entity] id={eid} ticker={ticker} name={dn}")
         print(f"  search={search[:220]}{'...' if len(search)>220 else ''}")
 
-        # Fetch
         articles = fetch_thenewsapi(cfg, search, start, end)
         print(f"  fetched={len(articles)}")
-
-        # If fetched=0 consistently, the #1 reason is domains restriction in JSON
-        # (paywalled sites or unsupported domains). Test by temporarily removing include[].
 
         for a in articles:
             url = (a.get("url") or "").strip()
@@ -817,7 +791,6 @@ def run_once() -> None:
                 continue
             url_hash = sha1_hex(url)
 
-            # Full text
             full_text = None
             fulltext_err = None
             if FULLTEXT_ENABLE:
