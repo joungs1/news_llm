@@ -3,7 +3,7 @@
     "interval_seconds": 600,
     "lookback_minutes": 5,
     "language": "en",
-    "limit": 50,
+    "limit": 1440,
     "iterations": null
   },
   "query": {
