@@ -54,7 +54,7 @@ SEARCH_OR_OP = os.getenv("NEWS_SEARCH_OR_OP", "|").strip()        # IMPORTANT: u
 
 # Full-text extraction guardrails
 FULLTEXT_ENABLE = os.getenv("NEWS_FULLTEXT_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
-FULLTEXT_TIMEOUT_S = int(os.getenv("NEWS_FULLTEXT_TIMEOUT_S", "20"))
+FULLTEXT_TIMEOUT_S = int(os.getenv("NEWS_FULLTEXT_TIMEOUT_S", "30"))
 FULLTEXT_MAX_CHARS = int(os.getenv("NEWS_FULLTEXT_MAX_CHARS", "18000"))
 HTTP_UA = os.getenv(
     "NEWS_HTTP_USER_AGENT",
